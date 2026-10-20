@@ -350,6 +350,8 @@ class GatewayEngine:
         attempt_id = f"att-{uuid.uuid4().hex[:12]}"
         pricing = self.registry.get_pricing_snapshot(request.pricing_snapshot_id)
         ended_at = started_at + (latency_ms / MS_PER_SECOND)
+        started_at_utc = round(started_at, 6)
+        ended_at_utc = max(started_at_utc, round(ended_at, 6))
 
         # Distinguish missing usage (None) vs explicitly reported 0
         if resp is not None:
@@ -382,8 +384,8 @@ class GatewayEngine:
             model_id=route.model_id,
             policy_leg=leg,
             attempt_kind=attempt_kind,
-            started_at_utc=started_at,
-            ended_at_utc=round(ended_at, 6),
+            started_at_utc=started_at_utc,
+            ended_at_utc=ended_at_utc,
             latency_ms=round(latency_ms, 2),
             outcome=outcome,
             detailed_outcome=outcome,
