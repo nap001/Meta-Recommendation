@@ -37,20 +37,20 @@ def test_openai_and_azure_provider_registrations():
     assert openai_prov is not None
     assert openai_prov.enabled is True
     openai_models = {m.model_id for m in openai_prov.models}
-    assert "gpt-4o" in openai_models
-    assert "gpt-4o-mini" in openai_models
+    assert "gpt-6" in openai_models
+    assert "gpt-6-mini" in openai_models
 
     azure_prov = registry.get_provider("azure_openai")
     assert azure_prov is not None
     assert azure_prov.enabled is True
     azure_models = {m.model_id for m in azure_prov.models}
-    assert "gpt-4o" in azure_models
-    assert "gpt-4o-mini" in azure_models
+    assert "gpt-6" in azure_models
+    assert "gpt-6-mini" in azure_models
 
     pricing = registry.get_pricing_snapshot("default-pricing-v1")
     # Verify pricing calculation for OpenAI and Azure OpenAI
-    cost_openai = pricing.calculate_cost_usd("openai", "gpt-4o-mini", 1000, 500)
-    cost_azure = pricing.calculate_cost_usd("azure_openai", "gpt-4o-mini", 1000, 500)
+    cost_openai = pricing.calculate_cost_usd("openai", "gpt-6-mini", 1000, 500)
+    cost_azure = pricing.calculate_cost_usd("azure_openai", "gpt-6-mini", 1000, 500)
     assert cost_openai > 0.0
     assert cost_azure > 0.0
 
@@ -81,9 +81,9 @@ def test_openai_to_azure_fallback_ladder():
         response_contract=ResponseContractV1(kind=ResponseKind.TEXT),
         routing_policy=RoutingPolicyV1(
             mode=RoutingMode.BASELINE,
-            baseline_route=RouteV1(provider_id="openai", model_id="gpt-4o-mini", policy_leg=PolicyLeg.BASELINE),
+            baseline_route=RouteV1(provider_id="openai", model_id="gpt-6-mini", policy_leg=PolicyLeg.BASELINE),
             fallback_routes=[
-                RouteV1(provider_id="azure_openai", model_id="gpt-4o-mini", policy_leg=PolicyLeg.FALLBACK)
+                RouteV1(provider_id="azure_openai", model_id="gpt-6-mini", policy_leg=PolicyLeg.FALLBACK)
             ],
         ),
         budget=BudgetConfigV1(deadline_ms=5000, max_physical_attempts=3, max_cost_usd=0.50),
