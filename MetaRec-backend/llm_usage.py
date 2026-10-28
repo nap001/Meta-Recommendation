@@ -18,6 +18,14 @@ deployed model. Configure real prices via:
 This module is deliberately dependency-free (stdlib only) so it can be imported
 from the low-level LLM client layer without pulling in the DB/service layers.
 The service layer owns starting a scope and flushing the ledger to storage.
+
+Exactly-once accounting with the LLM gateway (WP5): the gateway records one
+event per *physical* provider attempt, keyed by ``attempt_id`` — failed,
+retried and compatibility attempts included. ``UsageLedger.add`` ignores a
+repeated ``attempt_id``, and responses returned through the ``llm_compat``
+shim are marked as already recorded, so the ``record_response_usage(...)``
+calls that legacy call sites still make become no-ops instead of double
+charging.
 """
 from __future__ import annotations
 
@@ -30,13 +38,26 @@ from typing import Any, Optional
 
 @dataclass
 class UsageEvent:
-    """One LLM call's token usage (and its estimated cost)."""
+    """One LLM call's token usage (and its estimated cost).
+
+    The gateway metadata fields are optional so legacy constructors keep
+    working; ``attempt_id`` is the idempotency key for exactly-once recording.
+    """
 
     model: Optional[str]
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
     cost_usd: float
+    attempt_id: Optional[str] = None
+    request_id: Optional[str] = None
+    policy_tag: Optional[str] = None
+    provider_id: Optional[str] = None
+    policy_leg: Optional[str] = None
+    attempt_kind: Optional[str] = None
+    pricing_snapshot_id: Optional[str] = None
+    price_table_version: Optional[str] = None
+    is_usage_reported: bool = True
 
 
 @dataclass
@@ -44,9 +65,32 @@ class UsageLedger:
     """Accumulates the usage of every LLM call within a single scope."""
 
     events: list[UsageEvent] = field(default_factory=list)
+    _attempt_ids: set[str] = field(default_factory=set, repr=False, compare=False)
+    # id(response) -> (response, attempt_id). The strong reference pins the
+    # object so its id() cannot be reused while this (request-scoped) ledger
+    # lives; used for responses that cannot carry the marker attribute.
+    _recorded_responses: dict[int, tuple[Any, str]] = field(default_factory=dict, repr=False, compare=False)
 
-    def add(self, event: UsageEvent) -> None:
+    def add(self, event: UsageEvent) -> bool:
+        """Append ``event``; return ``False`` if its ``attempt_id`` was already recorded."""
+        if event.attempt_id is not None:
+            if event.attempt_id in self._attempt_ids:
+                return False
+            self._attempt_ids.add(event.attempt_id)
         self.events.append(event)
+        return True
+
+    def has_attempt(self, attempt_id: str) -> bool:
+        return attempt_id in self._attempt_ids
+
+    def mark_response(self, response: Any, attempt_id: str) -> None:
+        self._recorded_responses[id(response)] = (response, attempt_id)
+
+    def recorded_attempt_for(self, response: Any) -> Optional[str]:
+        entry = self._recorded_responses.get(id(response))
+        if entry is not None and entry[0] is response:
+            return entry[1]
+        return None
 
     @property
     def totals(self) -> dict[str, Any]:
@@ -125,14 +169,56 @@ def _usage_field(usage: Any, name: str) -> int:
         return 0
 
 
+# Marker attribute set on responses whose attempts the gateway already charged.
+GATEWAY_RECORDED_ATTR = "_llm_gateway_attempt_id"
+
+
+def mark_response_recorded(response: Any, attempt_id: str) -> None:
+    """Flag ``response`` as already charged by the gateway under ``attempt_id``.
+
+    The marker is set directly on the object when possible (SDK models,
+    namespaces); ``object.__setattr__`` bypasses pydantic field validation.
+    It is also registered on the active ledger, which covers objects that
+    cannot carry attributes (str, dict, ``__slots__`` classes).
+    """
+    if response is None:
+        return
+    try:
+        object.__setattr__(response, GATEWAY_RECORDED_ATTR, attempt_id)
+    except (AttributeError, TypeError):
+        pass
+    ledger = current_ledger()
+    if ledger is not None:
+        ledger.mark_response(response, attempt_id)
+
+
+def recorded_attempt_id(response: Any) -> Optional[str]:
+    """Return the gateway attempt that already charged ``response``, if any."""
+    if response is None or isinstance(response, dict):
+        attempt_id = None
+    else:
+        try:
+            attempt_id = object.__getattribute__(response, GATEWAY_RECORDED_ATTR)
+        except AttributeError:
+            attempt_id = None
+    if attempt_id is None:
+        ledger = current_ledger()
+        if ledger is not None:
+            attempt_id = ledger.recorded_attempt_for(response)
+    return attempt_id if isinstance(attempt_id, str) else None
+
+
 def record_response_usage(response: Any, model_hint: Optional[str] = None) -> Optional[UsageEvent]:
     """Record an LLM response's token usage into the current ledger.
 
-    No-op (returns ``None``) when there is no active ledger or the response
-    carries no usage — never raises, so it is safe to sprinkle at call sites.
+    No-op (returns ``None``) when there is no active ledger, the response
+    carries no usage, or the gateway already recorded the physical attempt(s)
+    behind this response — never raises, so it is safe to sprinkle at call sites.
     """
     ledger = current_ledger()
     if ledger is None:
+        return None
+    if recorded_attempt_id(response) is not None:
         return None
     usage = getattr(response, "usage", None)
     if usage is None and isinstance(response, dict):

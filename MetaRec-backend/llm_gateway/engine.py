@@ -153,6 +153,9 @@ class GatewayEngine:
     ) -> None:
         self.registry = registry or get_provider_registry()
         self.validator_hook = validator_hook
+        # Optional per-engine override of the module-level per-route attempt
+        # cap. ``budget.max_physical_attempts`` remains the binding limit.
+        self.max_attempts_per_route: Optional[int] = None
         self._adapters: Dict[str, BaseLLMAdapter] = {
             ProviderId.FAKE.value: FakeLLMAdapter(),
             ProviderId.GROQ.value: OpenAICompatibleAdapter(provider_id=ProviderId.GROQ.value),
@@ -168,6 +171,13 @@ class GatewayEngine:
 
     def register_adapter(self, provider_id: str, adapter: BaseLLMAdapter) -> None:
         self._adapters[provider_id] = adapter
+
+    def _route_attempt_cap(self) -> int:
+        """Per-route attempt cap: instance override, else the module default.
+
+        The module global is read at call time so tests can still monkey-patch it.
+        """
+        return self.max_attempts_per_route or _MAX_ATTEMPTS_PER_ROUTE
 
     def get_adapter(self, provider_id: str) -> BaseLLMAdapter:
         if provider_id in self._adapters:
@@ -366,7 +376,14 @@ class GatewayEngine:
             is_usage_reported = p_tokens is not None
 
         if is_usage_reported and p_tokens is not None and c_tokens is not None:
-            cost_usd = pricing.calculate_cost_usd(route.provider_id, route.model_id, p_tokens, c_tokens)
+            if self.registry.get_provider(route.provider_id) is None:
+                # Unregistered provider (e.g. the caller-supplied client behind
+                # the legacy llm_compat shim): the gateway cannot know the real
+                # endpoint, so keep the existing LLM_PRICE_* env price table.
+                from llm_usage import estimate_cost
+                cost_usd = estimate_cost(route.model_id, p_tokens, c_tokens)
+            else:
+                cost_usd = pricing.calculate_cost_usd(route.provider_id, route.model_id, p_tokens, c_tokens)
         else:
             cost_usd = 0.0
 
@@ -418,8 +435,17 @@ class GatewayEngine:
                     completion_tokens=event_comp,
                     total_tokens=event_total,
                     cost_usd=event_cost,
+                    attempt_id=attempt_id,
+                    request_id=request.request_id,
+                    policy_tag=request.policy_tag,
+                    provider_id=route.provider_id,
+                    policy_leg=leg.value,
+                    attempt_kind=attempt_kind.value,
+                    pricing_snapshot_id=request.pricing_snapshot_id,
+                    price_table_version=pricing.pricing_snapshot_id,
+                    is_usage_reported=is_usage_reported,
                 )
-                ledger.add(event)
+                ledger.add(event)  # idempotent on attempt_id
         except Exception as exc:
             logger.debug("Could not record to llm_usage ledger: %s", exc)
 
@@ -681,7 +707,8 @@ class GatewayEngine:
                 break
 
             route_attempts = 0
-            while route_attempts < _MAX_ATTEMPTS_PER_ROUTE:
+            retry_kind = AttemptKind.TRANSPORT_RETRY
+            while route_attempts < self._route_attempt_cap():
                 elapsed_ms = (time.monotonic() - start_time_monotonic) * MS_PER_SECOND
                 if elapsed_ms >= deadline_ms:
                     last_error = BudgetExhaustedError(GatewayErrorCode.DEADLINE_EXHAUSTED.value, f"Request deadline of {deadline_ms}ms exceeded")
@@ -712,7 +739,7 @@ class GatewayEngine:
                 attempt_count += 1
                 route_attempts += 1
                 att_kind = AttemptKind.INITIAL if attempt_count == 1 else (
-                    AttemptKind.ROUTE_FALLBACK if route_attempts == 1 else AttemptKind.TRANSPORT_RETRY
+                    AttemptKind.ROUTE_FALLBACK if route_attempts == 1 else retry_kind
                 )
 
                 att_start_utc = time.time()
@@ -776,6 +803,7 @@ class GatewayEngine:
                     )
                     attempts.append(attempt)
                     last_error = exc
+                    retry_kind = AttemptKind.COMPATIBILITY_RETRY
                     if "temperature" in str(exc).lower():
                         adaptations["removed_params"].append("temperature")
                     elif "max_tokens" in str(exc).lower() or "extra_body" in str(exc).lower():
@@ -791,6 +819,7 @@ class GatewayEngine:
                     )
                     attempts.append(attempt)
                     last_error = exc
+                    retry_kind = AttemptKind.TRANSPORT_RETRY
                     # Fix #1: exponential back-off with full jitter
                     sleep_sec = _jitter_sleep_seconds(route_attempts)
                     logger.debug(
@@ -849,7 +878,8 @@ class GatewayEngine:
                 break
 
             route_attempts = 0
-            while route_attempts < _MAX_ATTEMPTS_PER_ROUTE:
+            retry_kind = AttemptKind.TRANSPORT_RETRY
+            while route_attempts < self._route_attempt_cap():
                 elapsed_ms = (time.monotonic() - start_time_monotonic) * MS_PER_SECOND
                 if elapsed_ms >= deadline_ms:
                     last_error = BudgetExhaustedError(GatewayErrorCode.DEADLINE_EXHAUSTED.value, f"Request deadline of {deadline_ms}ms exceeded")
@@ -880,7 +910,7 @@ class GatewayEngine:
                 attempt_count += 1
                 route_attempts += 1
                 att_kind = AttemptKind.INITIAL if attempt_count == 1 else (
-                    AttemptKind.ROUTE_FALLBACK if route_attempts == 1 else AttemptKind.TRANSPORT_RETRY
+                    AttemptKind.ROUTE_FALLBACK if route_attempts == 1 else retry_kind
                 )
 
                 att_start_utc = time.time()
@@ -942,6 +972,7 @@ class GatewayEngine:
                     )
                     attempts.append(attempt)
                     last_error = exc
+                    retry_kind = AttemptKind.COMPATIBILITY_RETRY
                     if "temperature" in str(exc).lower():
                         adaptations["removed_params"].append("temperature")
                     elif "max_tokens" in str(exc).lower() or "extra_body" in str(exc).lower():
@@ -957,6 +988,7 @@ class GatewayEngine:
                     )
                     attempts.append(attempt)
                     last_error = exc
+                    retry_kind = AttemptKind.TRANSPORT_RETRY
                     # Fix #1: exponential back-off with full jitter (async-safe)
                     sleep_sec = _jitter_sleep_seconds(route_attempts)
                     logger.debug(

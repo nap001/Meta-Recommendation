@@ -156,38 +156,25 @@ def _adapt_request_from_error(request: Dict[str, Any], exc: Exception) -> str | 
 
 
 async def create_chat_completion_async(client: Any, **kwargs: Any) -> Any:
-    """Create an async chat completion with narrowly scoped compatibility retries."""
+    """Create an async chat completion routed through LLM Gateway with compatibility retries."""
+    from llm_gateway.legacy_shim import invoke_legacy_chat_completion_async
+
     request = prepare_chat_completion_request(**kwargs)
     tool_names = _sanitize_tool_names(request)
-    for _ in range(3):
-        try:
-            return _restore_tool_names(await client.chat.completions.create(**request), tool_names)
-        except Exception as exc:
-            adapted = _adapt_request_from_error(request, exc)
-            if adapted is None:
-                raise
-            logger.info(
-                "Retrying Chat Completions without unsupported %s for model=%s",
-                adapted,
-                request.get("model"),
-            )
-    raise RuntimeError("Chat Completions compatibility retry limit exceeded")
+    response = await invoke_legacy_chat_completion_async(
+        client, request, adapt_fn=_adapt_request_from_error
+    )
+    return _restore_tool_names(response, tool_names)
 
 
 def create_chat_completion(client: Any, **kwargs: Any) -> Any:
-    """Create a synchronous chat completion with compatibility retries."""
+    """Create a synchronous chat completion routed through LLM Gateway with compatibility retries."""
+    from llm_gateway.legacy_shim import invoke_legacy_chat_completion
+
     request = prepare_chat_completion_request(**kwargs)
     tool_names = _sanitize_tool_names(request)
-    for _ in range(3):
-        try:
-            return _restore_tool_names(client.chat.completions.create(**request), tool_names)
-        except Exception as exc:
-            adapted = _adapt_request_from_error(request, exc)
-            if adapted is None:
-                raise
-            logger.info(
-                "Retrying Chat Completions without unsupported %s for model=%s",
-                adapted,
-                request.get("model"),
-            )
-    raise RuntimeError("Chat Completions compatibility retry limit exceeded")
+    response = invoke_legacy_chat_completion(
+        client, request, adapt_fn=_adapt_request_from_error
+    )
+    return _restore_tool_names(response, tool_names)
+

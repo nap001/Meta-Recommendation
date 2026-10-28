@@ -14,6 +14,32 @@ AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "https://api.groq.com/openai/v1"
 
 
+# Compatibility patch: httpx >= 0.28 removed the deprecated `proxies` keyword argument
+# in favor of `proxy`. openai <= 1.12.0 passes `proxies=proxies` to SyncHttpxClientWrapper
+# and AsyncHttpxClientWrapper, causing TypeError on initialization when http_client is not
+# explicitly passed. This wrapper translates `proxies` to `proxy` safely.
+_orig_httpx_client_init = httpx.Client.__init__
+_orig_httpx_async_client_init = httpx.AsyncClient.__init__
+
+def _patched_httpx_client_init(self, *args, **kwargs):
+    if "proxies" in kwargs:
+        p = kwargs.pop("proxies")
+        if p is not None and "proxy" not in kwargs:
+            kwargs["proxy"] = p
+    return _orig_httpx_client_init(self, *args, **kwargs)
+
+def _patched_httpx_async_client_init(self, *args, **kwargs):
+    if "proxies" in kwargs:
+        p = kwargs.pop("proxies")
+        if p is not None and "proxy" not in kwargs:
+            kwargs["proxy"] = p
+    return _orig_httpx_async_client_init(self, *args, **kwargs)
+
+if "proxies" not in httpx.Client.__init__.__code__.co_varnames:
+    httpx.Client.__init__ = _patched_httpx_client_init
+    httpx.AsyncClient.__init__ = _patched_httpx_async_client_init
+
+
 def _first_env_value(*names: str, default: str = "") -> str:
     for name in names:
         value = os.getenv(name)
@@ -66,16 +92,22 @@ def get_openai_compatible_config() -> tuple[str, str]:
     return api_key, base_url
 
 
-def get_openai_compatible_transport_config() -> dict[str, object]:
+def get_openai_compatible_transport_config(*, managed: bool = True) -> dict[str, object]:
+    """Return transport settings for OpenAI-compatible clients.
+
+    On managed paths (managed=True), max_retries is 0 so the gateway engine owns
+    all physical attempts and retry accounting (mitigating Risk R1: hidden SDK
+    retry amplification).
+    """
     return {
         "timeout": _env_float("LLM_TIMEOUT_SECONDS", 30.0),
-        "max_retries": _env_int("LLM_SDK_MAX_RETRIES", 2),
+        "max_retries": 0 if managed else _env_int("LLM_SDK_MAX_RETRIES", 2),
         "trust_env": _env_bool("LLM_TRUST_ENV", True),
     }
 
 
 def describe_openai_compatible_config(model: str | None = None) -> str:
-    transport = get_openai_compatible_transport_config()
+    transport = get_openai_compatible_transport_config(managed=False)
     return (
         f"base_url={LLM_BASE_URL} "
         f"model={model or os.getenv('LLM_MODEL') or '(unset)'} "
@@ -86,13 +118,19 @@ def describe_openai_compatible_config(model: str | None = None) -> str:
     )
 
 
-def _client_kwargs(async_client: bool = False, timeout_seconds: float | None = None) -> dict[str, object]:
-    transport = get_openai_compatible_transport_config()
+def _client_kwargs(
+    async_client: bool = False,
+    timeout_seconds: float | None = None,
+    max_retries: int | None = None,
+    managed: bool = True,
+) -> dict[str, object]:
+    transport = get_openai_compatible_transport_config(managed=managed)
     api_key, base_url = get_openai_compatible_config()
+    effective_retries = max_retries if max_retries is not None else transport["max_retries"]
     kwargs: dict[str, object] = {
         "base_url": base_url,
         "api_key": api_key,
-        "max_retries": transport["max_retries"],
+        "max_retries": effective_retries,
     }
     timeout = transport["timeout"] if timeout_seconds is None else timeout_seconds
     if transport["trust_env"]:
@@ -106,15 +144,23 @@ def _client_kwargs(async_client: bool = False, timeout_seconds: float | None = N
 
 LLM_API_KEY, LLM_BASE_URL = get_openai_compatible_config()
 
-def create_sync_client(timeout_seconds: float | None = None):
-    client = OpenAI(**_client_kwargs(async_client=False, timeout_seconds=timeout_seconds))
+def create_sync_client(timeout_seconds: float | None = None, max_retries: int | None = None):
+    """Create a synchronous OpenAI-compatible client.
+
+    Managed clients set max_retries=0 by default so that the service layer
+    (engine.py) owns all retry, back-off, and budget accounting.
+    """
+    client = OpenAI(**_client_kwargs(async_client=False, timeout_seconds=timeout_seconds, max_retries=max_retries, managed=True))
     return client
 
-def create_sync_azure_client():
+def create_sync_azure_client(max_retries: int | None = None):
+    """Create a synchronous Azure OpenAI client with zero SDK retries on managed paths."""
+    effective_retries = 0 if max_retries is None else max_retries
     client = AzureOpenAI(
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", AZURE_ENDPOINT),
         api_key=os.getenv("OPENAI_API_KEY"),
         api_version=os.getenv("AZURE_OPENAI_API_VERSION", AZURE_API_VERSION),
+        max_retries=effective_retries,
     )
     return client
 
@@ -148,6 +194,8 @@ def create_agent_sync_client() -> tuple[object, str | None, str | None]:
             pass
     return create_sync_client(timeout_seconds=timeout_seconds), summary_model, planning_model
 
-def create_async_client():
-    client = AsyncOpenAI(**_client_kwargs(async_client=True))
+def create_async_client(timeout_seconds: float | None = None, max_retries: int | None = None):
+    """Create an asynchronous OpenAI-compatible client with zero SDK retries on managed paths."""
+    client = AsyncOpenAI(**_client_kwargs(async_client=True, timeout_seconds=timeout_seconds, max_retries=max_retries, managed=True))
     return client
+
