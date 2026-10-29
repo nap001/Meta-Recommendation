@@ -269,6 +269,13 @@ class GatewayEngine:
                 m_dict["name"] = msg.name
             messages_wire.append(m_dict)
 
+        if adaptations.get("validation_repair"):
+            errors = "; ".join(adaptations.get("validation_errors", []))
+            messages_wire.append({
+                "role": "user",
+                "content": f"The previous response failed contract validation: {errors}. Please return a repaired output strictly conforming to the required schema and constraints."
+            })
+
         kwargs: Dict[str, Any] = {
             "model": route.model_id,
             "messages": messages_wire,
@@ -594,7 +601,62 @@ class GatewayEngine:
                 return True
             if "json schema error:" in err_lower:
                 return True
+            if "response contract preflight failed:" in err_lower:
+                return True
         return False
+
+    def _is_registered_contract(self, request: LLMRequestV1) -> bool:
+        """Check whether request contract belongs to Member B's registered contracts."""
+        try:
+            from llm_gateway.validation.schemas import (
+                CONFIRMATION_PAYLOAD_SCHEMA_ID,
+                CONVERSATION_SUMMARY_SCHEMA_ID,
+                registered_response_schema_ids,
+            )
+            schema_id = request.response_contract.schema_id
+            return schema_id in registered_response_schema_ids() or schema_id in (
+                CONFIRMATION_PAYLOAD_SCHEMA_ID,
+                CONVERSATION_SUMMARY_SCHEMA_ID,
+            )
+        except Exception:
+            return False
+
+    def _execute_registered_validation_hook(
+        self,
+        request: LLMRequestV1,
+        resp: RawAdapterResponse,
+        sanitized_mapping: Dict[str, str],
+    ) -> ValidationGateResultV1:
+        """Dispatch to Member B's create_wp5_external_validation_hook for registered contracts."""
+        from llm_gateway.validation import (
+            CONFIRMATION_PAYLOAD_SCHEMA_ID,
+            ConfirmationNormalizationContext,
+            create_wp5_external_validation_hook,
+            register_wp5_semantic_validators,
+        )
+        from llm_gateway.validators import ValidatorRegistry
+
+        registry = ValidatorRegistry()
+        register_wp5_semantic_validators(registry)
+
+        confirmation_context = None
+        if request.response_contract.schema_id == CONFIRMATION_PAYLOAD_SCHEMA_ID:
+            lang = str(request.response_contract.validator_inputs.get("language", "en") or "en")
+            if lang not in {"en", "zh"}:
+                lang = "en"
+            fallback = str(request.response_contract.validator_inputs.get("fallback_message", "") or "").strip()
+            if not fallback:
+                fallback = "Please confirm this request."
+            confirmation_context = ConfirmationNormalizationContext(
+                language=lang,
+                fallback_message=fallback,
+            )
+
+        hook = create_wp5_external_validation_hook(
+            registry=registry,
+            confirmation_context=confirmation_context,
+        )
+        return hook(request, resp, sanitized_mapping)
 
     def _execute_validation_sync(
         self,
@@ -622,6 +684,16 @@ class GatewayEngine:
                 val_summary = ValidationSummaryV1(
                     validator_id=request.response_contract.semantic_validator_id,
                     errors=[f"External validator error: {exc}"],
+                )
+                return ValidationGateResultV1(passed=False, summary=val_summary, payload=None)
+        elif self._is_registered_contract(request):
+            try:
+                return self._execute_registered_validation_hook(request, resp, sanitized_mapping)
+            except Exception as exc:
+                logger.warning("execute_validation_hook error: %s", exc)
+                val_summary = ValidationSummaryV1(
+                    validator_id=request.response_contract.semantic_validator_id,
+                    errors=[f"Validation hook error: {exc}"],
                 )
                 return ValidationGateResultV1(passed=False, summary=val_summary, payload=None)
 
@@ -654,6 +726,16 @@ class GatewayEngine:
                 val_summary = ValidationSummaryV1(
                     validator_id=request.response_contract.semantic_validator_id,
                     errors=[f"External validator error: {exc}"],
+                )
+                return ValidationGateResultV1(passed=False, summary=val_summary, payload=None)
+        elif self._is_registered_contract(request):
+            try:
+                return self._execute_registered_validation_hook(request, resp, sanitized_mapping)
+            except Exception as exc:
+                logger.warning("execute_validation_hook error: %s", exc)
+                val_summary = ValidationSummaryV1(
+                    validator_id=request.response_contract.semantic_validator_id,
+                    errors=[f"Validation hook error: {exc}"],
                 )
                 return ValidationGateResultV1(passed=False, summary=val_summary, payload=None)
 
@@ -707,6 +789,7 @@ class GatewayEngine:
                 break
 
             route_attempts = 0
+            validation_retries = 0
             retry_kind = AttemptKind.TRANSPORT_RETRY
             while route_attempts < self._route_attempt_cap():
                 elapsed_ms = (time.monotonic() - start_time_monotonic) * MS_PER_SECOND
@@ -793,6 +876,26 @@ class GatewayEngine:
                         last_error = val_err
                         if self._is_terminal_validation_error(val_summary):
                             terminal_failure = True
+                            break
+
+                        # Cheap-first route triggers immediate fallback to baseline on semantic violation
+                        if val_summary.semantic == ValidationGateStatus.FAILED and leg == PolicyLeg.CHEAP:
+                            break
+
+                        # Trigger bounded validation repair attempt if within budget and eligible contract
+                        can_repair = (
+                            validation_retries < 1
+                            and route_attempts < self._route_attempt_cap()
+                            and attempt_count < request.budget.max_physical_attempts
+                            and (self._is_registered_contract(request) or request.policy_tag == "confirmation.payload")
+                        )
+                        if can_repair:
+                            retry_kind = AttemptKind.VALIDATION_RETRY
+                            validation_retries += 1
+                            adaptations["validation_repair"] = True
+                            adaptations["validation_errors"] = list(val_summary.errors)
+                            continue
+
                         break  # Fall back to next route in ladder unless terminal failure
 
                 except CompatibilityError as exc:
@@ -878,6 +981,7 @@ class GatewayEngine:
                 break
 
             route_attempts = 0
+            validation_retries = 0
             retry_kind = AttemptKind.TRANSPORT_RETRY
             while route_attempts < self._route_attempt_cap():
                 elapsed_ms = (time.monotonic() - start_time_monotonic) * MS_PER_SECOND
@@ -962,6 +1066,26 @@ class GatewayEngine:
                         last_error = val_err
                         if self._is_terminal_validation_error(val_summary):
                             terminal_failure = True
+                            break
+
+                        # Cheap-first route triggers immediate fallback to baseline on semantic violation
+                        if val_summary.semantic == ValidationGateStatus.FAILED and leg == PolicyLeg.CHEAP:
+                            break
+
+                        # Trigger bounded validation repair attempt if within budget and eligible contract
+                        can_repair = (
+                            validation_retries < 1
+                            and route_attempts < self._route_attempt_cap()
+                            and attempt_count < request.budget.max_physical_attempts
+                            and (self._is_registered_contract(request) or request.policy_tag == "confirmation.payload")
+                        )
+                        if can_repair:
+                            retry_kind = AttemptKind.VALIDATION_RETRY
+                            validation_retries += 1
+                            adaptations["validation_repair"] = True
+                            adaptations["validation_errors"] = list(val_summary.errors)
+                            continue
+
                         break
 
                 except CompatibilityError as exc:
