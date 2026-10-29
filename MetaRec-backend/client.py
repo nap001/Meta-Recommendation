@@ -9,7 +9,7 @@ dotenv_path = find_dotenv()
 load_dotenv(dotenv_path)
 
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://agenthiack.openai.azure.com/")
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "https://api.groq.com/openai/v1"
 
@@ -156,9 +156,13 @@ def create_sync_client(timeout_seconds: float | None = None, max_retries: int | 
 def create_sync_azure_client(max_retries: int | None = None):
     """Create a synchronous Azure OpenAI client with zero SDK retries on managed paths."""
     effective_retries = 0 if max_retries is None else max_retries
+    endpoint = (os.getenv("AZURE_OPENAI_ENDPOINT") or AZURE_ENDPOINT or "").strip()
+    if not endpoint:
+        raise ValueError("AZURE_OPENAI_ENDPOINT is not set.")
+    azure_key = (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
     client = AzureOpenAI(
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", AZURE_ENDPOINT),
-        api_key=os.getenv("OPENAI_API_KEY"),
+        azure_endpoint=endpoint,
+        api_key=azure_key,
         api_version=os.getenv("AZURE_OPENAI_API_VERSION", AZURE_API_VERSION),
         max_retries=effective_retries,
     )

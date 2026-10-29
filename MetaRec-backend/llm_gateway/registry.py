@@ -103,7 +103,7 @@ class PricingSnapshotV1(BaseModel):
         cost = (prompt_tokens / TOKENS_PER_MILLION) * rate.input_price_per_1m + (
             completion_tokens / TOKENS_PER_MILLION
         ) * rate.output_price_per_1m
-        return round(cost, 6)
+        return round(cost, 8)
 
 
 
@@ -326,6 +326,34 @@ class ProviderRegistry:
         self.register_pricing_snapshot(default_pricing)
 
 
+def _validate_catalog_url(url: str) -> None:
+    """Validate external catalog URL to prevent SSRF against internal/metadata services."""
+    import ipaddress
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https":
+        raise ValueError(f"SSRF Protection: Only HTTPS catalog URLs are permitted, got '{parsed.scheme}'.")
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        raise ValueError("SSRF Protection: Catalog URL must specify a valid hostname.")
+
+    # Check for direct IP address
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise ValueError(f"SSRF Protection: Access to private/internal IP {ip} is forbidden.")
+        # Specific check for cloud instance metadata service (169.254.169.254)
+        if str(ip) == "169.254.169.254":
+            raise ValueError("SSRF Protection: Access to cloud instance metadata service is forbidden.")
+    except ValueError as val_err:
+        if "SSRF Protection" in str(val_err):
+            raise
+        # Hostname string check
+        if hostname in ("localhost", "127.0.0.1", "::1", "metadata.google.internal") or hostname.endswith(".local") or hostname.endswith(".internal"):
+            raise ValueError(f"SSRF Protection: Access to internal host '{hostname}' is forbidden.")
+
+
 class DynamicProviderRegistry(ProviderRegistry):
     """Provider registry with dynamic external catalog synchronization capabilities."""
 
@@ -339,12 +367,14 @@ class DynamicProviderRegistry(ProviderRegistry):
         """Fetch model context windows, max output limits, and pricing from an external JSON feed.
 
         Guarantees:
+        - Strict SSRF validation preventing egress to internal, private, or metadata IPs.
         - Strict Pydantic validation against ModelLimitV1 and ModelPriceV1.
         - Non-conforming/malformed entries are skipped individually.
         - Entire operation is wrapped in try/except; on network or JSON failure, it logs a warning
           and preserves all existing registered defaults without overwriting.
         """
         try:
+            _validate_catalog_url(url)
             raw_data: Any = None
             if http_client is not None:
                 resp = await http_client.get(url, timeout=timeout_seconds)
