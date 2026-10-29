@@ -11,6 +11,28 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 import httpx
+
+if "proxies" not in httpx.Client.__init__.__code__.co_varnames:
+    _orig_client_init = httpx.Client.__init__
+    _orig_async_init = httpx.AsyncClient.__init__
+
+    def _patched_client_init(self, *args, **kwargs):
+        if "proxies" in kwargs:
+            p = kwargs.pop("proxies")
+            if p is not None and "proxy" not in kwargs:
+                kwargs["proxy"] = p
+        return _orig_client_init(self, *args, **kwargs)
+
+    def _patched_async_init(self, *args, **kwargs):
+        if "proxies" in kwargs:
+            p = kwargs.pop("proxies")
+            if p is not None and "proxy" not in kwargs:
+                kwargs["proxy"] = p
+        return _orig_async_init(self, *args, **kwargs)
+
+    httpx.Client.__init__ = _patched_client_init
+    httpx.AsyncClient.__init__ = _patched_async_init
+
 from openai import AsyncAzureOpenAI, AsyncOpenAI, AzureOpenAI, OpenAI
 
 from llm_gateway.adapters.base import BaseLLMAdapter, RawAdapterResponse
@@ -50,14 +72,10 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
         self._sync_client_cache: Dict[tuple, Any] = {}
         self._async_client_cache: Dict[tuple, Any] = {}
 
-    def _get_sync_client(self, is_azure: bool = False, timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS) -> Any:
-        """Return a cached sync SDK client, creating one if needed."""
-        cache_key = (is_azure, timeout_seconds)
-        if cache_key in self._sync_client_cache:
-            return self._sync_client_cache[cache_key]
-
+    def _resolve_config(self, is_azure: bool) -> tuple[str, str]:
+        """Resolve API key and base URL strictly scoped to this provider (no cross-vendor leakage)."""
         if is_azure:
-            azure_key = self.api_key or os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+            azure_key = self.api_key or os.getenv("AZURE_OPENAI_API_KEY") or ""
             azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
             if not azure_endpoint:
                 raise ConfigurationError(
@@ -65,25 +83,37 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                     "Set it to your Azure OpenAI resource endpoint, e.g. "
                     "https://<resource>.openai.azure.com/"
                 )
+            return azure_key, azure_endpoint
+        elif self.provider_id == ProviderId.OPENAI.value:
+            api_key = self.api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY") or ""
+            base_url = self.base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL
+            return api_key, base_url
+        elif self.provider_id == ProviderId.GROQ.value:
+            api_key = self.api_key or os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY") or ""
+            base_url = self.base_url or os.getenv("GROQ_BASE_URL") or os.getenv("LLM_BASE_URL") or DEFAULT_GROQ_BASE_URL
+            return api_key, base_url
+        else:
+            api_key = self.api_key or os.getenv("LLM_API_KEY") or ""
+            base_url = self.base_url or os.getenv("LLM_BASE_URL") or DEFAULT_OPENAI_BASE_URL
+            return api_key, base_url
+
+    def _get_sync_client(self, is_azure: bool = False, timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS) -> Any:
+        """Return a cached sync SDK client, creating one if needed."""
+        api_key, base_url = self._resolve_config(is_azure)
+        key_id = api_key[:8] if api_key else "none"
+        cache_key = (self.provider_id, is_azure, base_url, key_id, round(timeout_seconds, 2))
+        if cache_key in self._sync_client_cache:
+            return self._sync_client_cache[cache_key]
+
+        if is_azure:
             client = AzureOpenAI(
-                azure_endpoint=azure_endpoint,
-                api_key=azure_key,
+                azure_endpoint=base_url,
+                api_key=api_key,
                 api_version=os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_API_VERSION),
                 max_retries=0,  # CRITICAL: zero SDK retries
                 timeout=timeout_seconds,
             )
-        elif self.provider_id == ProviderId.OPENAI.value:
-            api_key = self.api_key or os.getenv("OPENAI_API_KEY") or ""
-            base_url = self.base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL
-            client = OpenAI(
-                base_url=base_url,
-                api_key=api_key,
-                max_retries=0,
-                timeout=timeout_seconds,
-            )
         else:
-            api_key = self.api_key or os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-            base_url = self.base_url or os.getenv("LLM_BASE_URL") or DEFAULT_GROQ_BASE_URL
             client = OpenAI(
                 base_url=base_url,
                 api_key=api_key,
@@ -96,38 +126,21 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
 
     def _get_async_client(self, is_azure: bool = False, timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS) -> Any:
         """Return a cached async SDK client, creating one if needed."""
-        cache_key = (is_azure, timeout_seconds)
+        api_key, base_url = self._resolve_config(is_azure)
+        key_id = api_key[:8] if api_key else "none"
+        cache_key = (self.provider_id, is_azure, base_url, key_id, round(timeout_seconds, 2))
         if cache_key in self._async_client_cache:
             return self._async_client_cache[cache_key]
 
         if is_azure:
-            azure_key = self.api_key or os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-            azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-            if not azure_endpoint:
-                raise ConfigurationError(
-                    "AZURE_OPENAI_ENDPOINT environment variable is not set. "
-                    "Set it to your Azure OpenAI resource endpoint, e.g. "
-                    "https://<resource>.openai.azure.com/"
-                )
             client = AsyncAzureOpenAI(
-                azure_endpoint=azure_endpoint,
-                api_key=azure_key,
+                azure_endpoint=base_url,
+                api_key=api_key,
                 api_version=os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_API_VERSION),
                 max_retries=0,  # CRITICAL: zero SDK retries
                 timeout=timeout_seconds,
             )
-        elif self.provider_id == ProviderId.OPENAI.value:
-            api_key = self.api_key or os.getenv("OPENAI_API_KEY") or ""
-            base_url = self.base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL
-            client = AsyncOpenAI(
-                base_url=base_url,
-                api_key=api_key,
-                max_retries=0,
-                timeout=timeout_seconds,
-            )
         else:
-            api_key = self.api_key or os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-            base_url = self.base_url or os.getenv("LLM_BASE_URL") or DEFAULT_GROQ_BASE_URL
             client = AsyncOpenAI(
                 base_url=base_url,
                 api_key=api_key,
@@ -224,6 +237,46 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
         try:
             resp = await client.chat.completions.create(**normalized_kwargs)
             return self._parse_sdk_response(resp, route.model_id)
+        except Exception as exc:
+            raise self._handle_exception(exc) from exc
+
+    def execute_stream(
+        self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
+    ):
+        """Execute synchronous streaming request yielding delta tokens."""
+        is_azure = route.provider_id == ProviderId.AZURE_OPENAI.value
+        client = self._get_sync_client(is_azure=is_azure, timeout_seconds=request.budget.deadline_ms / MS_PER_SECOND)
+        stream_kwargs = dict(normalized_kwargs)
+        stream_kwargs["stream"] = True
+        try:
+            stream_resp = client.chat.completions.create(**stream_kwargs)
+            for chunk in stream_resp:
+                choices = getattr(chunk, "choices", []) or []
+                if choices:
+                    delta = getattr(choices[0], "delta", None)
+                    content = getattr(delta, "content", None)
+                    if content:
+                        yield content
+        except Exception as exc:
+            raise self._handle_exception(exc) from exc
+
+    async def execute_stream_async(
+        self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
+    ):
+        """Execute asynchronous streaming request yielding delta tokens."""
+        is_azure = route.provider_id == ProviderId.AZURE_OPENAI.value
+        client = self._get_async_client(is_azure=is_azure, timeout_seconds=request.budget.deadline_ms / MS_PER_SECOND)
+        stream_kwargs = dict(normalized_kwargs)
+        stream_kwargs["stream"] = True
+        try:
+            stream_resp = await client.chat.completions.create(**stream_kwargs)
+            async for chunk in stream_resp:
+                choices = getattr(chunk, "choices", []) or []
+                if choices:
+                    delta = getattr(choices[0], "delta", None)
+                    content = getattr(delta, "content", None)
+                    if content:
+                        yield content
         except Exception as exc:
             raise self._handle_exception(exc) from exc
 

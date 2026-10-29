@@ -44,13 +44,31 @@ class AnthropicAdapter(BaseLLMAdapter):
         self.api_key = api_key
         self._http_client = http_client
         self._async_http_client = async_http_client
+        self._shared_http_client: Optional[httpx.Client] = None
+        self._shared_async_client: Optional[httpx.AsyncClient] = None
+
+    def _get_sync_client(self, timeout_sec: float) -> httpx.Client:
+        if self._http_client is not None:
+            return self._http_client
+        if self._shared_http_client is None or self._shared_http_client.is_closed:
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+            self._shared_http_client = httpx.Client(limits=limits, timeout=timeout_sec)
+        return self._shared_http_client
+
+    def _get_async_client(self, timeout_sec: float) -> httpx.AsyncClient:
+        if self._async_http_client is not None:
+            return self._async_http_client
+        if self._shared_async_client is None or self._shared_async_client.is_closed:
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+            self._shared_async_client = httpx.AsyncClient(limits=limits, timeout=timeout_sec)
+        return self._shared_async_client
 
     def _get_base_url(self) -> str:
         url = self.base_url or os.getenv("ANTHROPIC_BASE_URL") or DEFAULT_ANTHROPIC_BASE_URL
         return url.rstrip("/")
 
     def _get_api_key(self) -> str:
-        return (self.api_key or os.getenv("ANTHROPIC_API_KEY") or os.getenv("LLM_API_KEY") or "").strip()
+        return (self.api_key or os.getenv("ANTHROPIC_API_KEY") or "").strip()
 
 
     def _get_headers(self) -> Dict[str, str]:
@@ -271,25 +289,15 @@ class AnthropicAdapter(BaseLLMAdapter):
         timeout_sec = request.budget.deadline_ms / MS_PER_SECOND
 
         try:
-            if self._http_client is not None:
-                resp = self._http_client.post(url, json=payload, headers=headers)
-                if resp.status_code != HTTP_STATUS_OK:
-                    try:
-                        err_json = resp.json()
-                    except Exception:
-                        err_json = resp.text
-                    raise self._handle_http_error(resp.status_code, err_json)
-                return self._parse_anthropic_response(resp.json(), route.model_id)
-
-            with httpx.Client(timeout=timeout_sec) as client:
-                resp = client.post(url, json=payload, headers=headers)
-                if resp.status_code != HTTP_STATUS_OK:
-                    try:
-                        err_json = resp.json()
-                    except Exception:
-                        err_json = resp.text
-                    raise self._handle_http_error(resp.status_code, err_json)
-                return self._parse_anthropic_response(resp.json(), route.model_id)
+            client = self._get_sync_client(timeout_sec)
+            resp = client.post(url, json=payload, headers=headers)
+            if resp.status_code != HTTP_STATUS_OK:
+                try:
+                    err_json = resp.json()
+                except Exception:
+                    err_json = resp.text
+                raise self._handle_http_error(resp.status_code, err_json)
+            return self._parse_anthropic_response(resp.json(), route.model_id)
         except Exception as exc:
             raise self._handle_exception(exc) from exc
 
@@ -303,25 +311,77 @@ class AnthropicAdapter(BaseLLMAdapter):
         timeout_sec = request.budget.deadline_ms / MS_PER_SECOND
 
         try:
-            if self._async_http_client is not None:
-                resp = await self._async_http_client.post(url, json=payload, headers=headers)
-                if resp.status_code != HTTP_STATUS_OK:
-                    try:
-                        err_json = resp.json()
-                    except Exception:
-                        err_json = resp.text
-                    raise self._handle_http_error(resp.status_code, err_json)
-                return self._parse_anthropic_response(resp.json(), route.model_id)
+            client = self._get_async_client(timeout_sec)
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code != HTTP_STATUS_OK:
+                try:
+                    err_json = resp.json()
+                except Exception:
+                    err_json = resp.text
+                raise self._handle_http_error(resp.status_code, err_json)
+            return self._parse_anthropic_response(resp.json(), route.model_id)
+        except Exception as exc:
+            raise self._handle_exception(exc) from exc
 
-            async with httpx.AsyncClient(timeout=timeout_sec) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+    def execute_stream(
+        self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
+    ):
+        """Execute synchronous streaming Messages request yielding delta tokens."""
+        payload = self._format_anthropic_payload(request, route, normalized_kwargs)
+        payload["stream"] = True
+        url = f"{self._get_base_url()}/v1/messages"
+        headers = self._get_headers()
+        timeout_sec = request.budget.deadline_ms / MS_PER_SECOND
+
+        try:
+            client = self._get_sync_client(timeout_sec)
+            with client.stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code != HTTP_STATUS_OK:
-                    try:
-                        err_json = resp.json()
-                    except Exception:
-                        err_json = resp.text
-                    raise self._handle_http_error(resp.status_code, err_json)
-                return self._parse_anthropic_response(resp.json(), route.model_id)
+                    resp.read()
+                    raise self._handle_http_error(resp.status_code, resp.text)
+                for line in resp.iter_lines():
+                    if line.startswith("data: "):
+                        raw_data = line[len("data: ") :].strip()
+                        try:
+                            event = json.loads(raw_data)
+                            if event.get("type") == "content_block_delta":
+                                delta = event.get("delta", {}) or {}
+                                text = delta.get("text")
+                                if text:
+                                    yield text
+                        except Exception:
+                            continue
+        except Exception as exc:
+            raise self._handle_exception(exc) from exc
+
+    async def execute_stream_async(
+        self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
+    ):
+        """Execute asynchronous streaming Messages request yielding delta tokens."""
+        payload = self._format_anthropic_payload(request, route, normalized_kwargs)
+        payload["stream"] = True
+        url = f"{self._get_base_url()}/v1/messages"
+        headers = self._get_headers()
+        timeout_sec = request.budget.deadline_ms / MS_PER_SECOND
+
+        try:
+            client = self._get_async_client(timeout_sec)
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code != HTTP_STATUS_OK:
+                    await resp.aread()
+                    raise self._handle_http_error(resp.status_code, resp.text)
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: "):
+                        raw_data = line[len("data: ") :].strip()
+                        try:
+                            event = json.loads(raw_data)
+                            if event.get("type") == "content_block_delta":
+                                delta = event.get("delta", {}) or {}
+                                text = delta.get("text")
+                                if text:
+                                    yield text
+                        except Exception:
+                            continue
         except Exception as exc:
             raise self._handle_exception(exc) from exc
 

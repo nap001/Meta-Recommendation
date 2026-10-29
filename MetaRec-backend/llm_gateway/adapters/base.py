@@ -37,3 +37,15 @@ class BaseLLMAdapter(ABC):
     ) -> RawAdapterResponse:
         """Execute asynchronous request to provider."""
         raise NotImplementedError
+
+    def execute_stream(
+        self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
+    ):
+        """Execute synchronous streaming request yielding string delta tokens."""
+        raise NotImplementedError(f"Streaming not implemented for adapter {type(self).__name__}")
+
+    async def execute_stream_async(
+        self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
+    ):
+        """Execute asynchronous streaming request yielding string delta tokens."""
+        raise NotImplementedError(f"Async streaming not implemented for adapter {type(self).__name__}")

@@ -92,8 +92,13 @@ class FakeLLMAdapter(BaseLLMAdapter):
             model=route.model_id,
         )
 
+    def _append_history(self, entry: Dict[str, Any]) -> None:
+        if len(self.call_history) >= 1000:
+            self.call_history.pop(0)
+        self.call_history.append(entry)
+
     def execute(self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]) -> RawAdapterResponse:
-        self.call_history.append(
+        self._append_history(
             {"request": request, "route": route, "kwargs": normalized_kwargs, "timestamp": time.time()}
         )
 
@@ -134,7 +139,7 @@ class FakeLLMAdapter(BaseLLMAdapter):
     async def execute_async(
         self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
     ) -> RawAdapterResponse:
-        self.call_history.append(
+        self._append_history(
             {"request": request, "route": route, "kwargs": normalized_kwargs, "timestamp": time.time()}
         )
 
@@ -171,4 +176,26 @@ class FakeLLMAdapter(BaseLLMAdapter):
             provider_request_id=scripted.provider_request_id,
             model=route.model_id,
         )
+
+    def execute_stream(
+        self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
+    ):
+        """Yield deterministic streaming delta tokens."""
+        raw_resp = self.execute(request, route, normalized_kwargs)
+        text = raw_resp.text or ""
+        # Chunk text by words or default token slices
+        words = text.split(" ")
+        for i, word in enumerate(words):
+            yield word + (" " if i < len(words) - 1 else "")
+
+    async def execute_stream_async(
+        self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
+    ):
+        """Asynchronously yield deterministic streaming delta tokens."""
+        raw_resp = await self.execute_async(request, route, normalized_kwargs)
+        text = raw_resp.text or ""
+        words = text.split(" ")
+        for i, word in enumerate(words):
+            yield word + (" " if i < len(words) - 1 else "")
+            await asyncio.sleep(0.001)
 
