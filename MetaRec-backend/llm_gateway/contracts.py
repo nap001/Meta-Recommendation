@@ -160,6 +160,25 @@ class ScopedToolCatalogV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class LLMToolDefinitionV1(BaseModel):
+    """Outbound tool definition projected from WP7 tool catalog (WP5 spec L226-234)."""
+    source_tool_name: str
+    llm_tool_name: str
+    description: str = ""
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    model_config = ConfigDict(extra="forbid")
+
+
+class LLMToolProjectionV1(BaseModel):
+    """Internal tool projection for selected LLM source (WP5 spec L226-234)."""
+    projection_id: str
+    catalog_id: str
+    health_snapshot_id: str
+    provider_id: str
+    definitions: List[LLMToolDefinitionV1] = Field(default_factory=list)
+    model_config = ConfigDict(extra="forbid")
+
+
 class LLMRequestV1(BaseModel):
     schema_version: str = SCHEMA_VERSION_LLM_REQUEST
     request_id: str
@@ -179,13 +198,14 @@ class LLMRequestV1(BaseModel):
 
     @model_validator(mode="after")
     def validate_tool_choice(self) -> "LLMRequestV1":
-        """Ensure tool_choice is 'none', 'auto', or belongs to scoped catalog."""
+        """Ensure tool_choice is 'none', 'auto', or belongs to scoped catalog and not excluded."""
         if self.tool_choice is not None:
             if self.tool_choice in ("none", "auto"):
                 return self
             if not self.tools:
                 raise ValueError(f"Forced tool_choice '{self.tool_choice}' specified but no tools catalog provided")
-            allowed_names = {t.name for t in self.tools.tools}
+            excluded = set(self.tools.excluded) if self.tools.excluded else set()
+            allowed_names = {t.name for t in self.tools.tools} - excluded
             if self.tool_choice not in allowed_names:
                 raise ValueError(
                     f"Forced tool_choice '{self.tool_choice}' is not present in scoped catalog tools: {allowed_names}"

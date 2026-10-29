@@ -69,6 +69,8 @@ from llm_gateway.contracts import (
     LLMErrorPayloadV1,
     LLMRequestV1,
     LLMResultV1,
+    LLMToolDefinitionV1,
+    LLMToolProjectionV1,
     OutputPayloadV1,
     PhysicalAttemptV1,
     PolicyLeg,
@@ -136,6 +138,41 @@ def _jitter_sleep_seconds(attempt_number: int) -> float:
     return sleep_ms / MS_PER_SECOND
 
 
+class RouteCircuitBreaker:
+    """Automated circuit breaker per (provider_id, model_id) to prevent cascading outage storms."""
+
+    def __init__(self, failure_threshold: int = 5, recovery_timeout_sec: float = 30.0) -> None:
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout_sec = recovery_timeout_sec
+        self._failures: Dict[Tuple[str, str], int] = {}
+        self._opened_at: Dict[Tuple[str, str], float] = {}
+
+    def is_available(self, provider_id: str, model_id: str) -> bool:
+        key = (provider_id, model_id)
+        opened = self._opened_at.get(key)
+        if opened is None:
+            return True
+        if time.monotonic() - opened > self.recovery_timeout_sec:
+            return True  # Half-open probe attempt
+        return False
+
+    def record_failure(self, provider_id: str, model_id: str) -> None:
+        key = (provider_id, model_id)
+        self._failures[key] = self._failures.get(key, 0) + 1
+        if self._failures[key] >= self.failure_threshold:
+            self._opened_at[key] = time.monotonic()
+            logger.warning(
+                "Circuit breaker tripped OPEN for %s/%s after %d consecutive failures.",
+                provider_id,
+                model_id,
+                self._failures[key],
+            )
+
+    def record_success(self, provider_id: str, model_id: str) -> None:
+        key = (provider_id, model_id)
+        self._failures.pop(key, None)
+        self._opened_at.pop(key, None)
+
 
 class GatewayEngine:
     """Execution engine for LLMRequestV1 -> LLMResultV1 lifecycle.
@@ -153,6 +190,7 @@ class GatewayEngine:
     ) -> None:
         self.registry = registry or get_provider_registry()
         self.validator_hook = validator_hook
+        self.circuit_breaker = RouteCircuitBreaker()
         # Optional per-engine override of the module-level per-route attempt
         # cap. ``budget.max_physical_attempts`` remains the binding limit.
         self.max_attempts_per_route: Optional[int] = None
@@ -164,6 +202,7 @@ class GatewayEngine:
             ProviderId.OPENAI_BASE.value: OpenAIBaseAdapter(provider_id=ProviderId.OPENAI_BASE.value),
             ProviderId.ANTHROPIC.value: AnthropicAdapter(provider_id=ProviderId.ANTHROPIC.value),
         }
+        self.last_tool_projection: Optional[LLMToolProjectionV1] = None
 
     def set_validator_hook(self, hook: Optional[Callable[..., Any]]) -> None:
         """Register or clear an external validator hook."""
@@ -258,6 +297,127 @@ class GatewayEngine:
                     break
         return requested
 
+    def _build_tool_projection(
+        self, request: LLMRequestV1, route: RouteV1
+    ) -> Tuple[Optional[LLMToolProjectionV1], Dict[str, str]]:
+        """Build internal LLMToolProjectionV1 enforcing monotonic WP7 tool catalog scoping (WP5 L226-234)."""
+        if not request.tools or not request.tools.tools:
+            return None, {}
+        excluded_names = set(request.tools.excluded) if request.tools.excluded else set()
+        taken = {t.name for t in request.tools.tools}
+        sanitized_mapping: Dict[str, str] = {}
+        definitions: List[LLMToolDefinitionV1] = []
+
+        for t in request.tools.tools:
+            orig_name = t.name
+            if orig_name in excluded_names:
+                continue
+            wire_name = orig_name
+            if not _TOOL_NAME_ALLOWED_RE.match(orig_name):
+                candidate = re.sub(r"[^a-zA-Z0-9_-]", "_", orig_name)
+                while candidate in taken or candidate in sanitized_mapping:
+                    candidate += "_"
+                wire_name = candidate
+                sanitized_mapping[wire_name] = orig_name
+
+            definitions.append(
+                LLMToolDefinitionV1(
+                    source_tool_name=orig_name,
+                    llm_tool_name=wire_name,
+                    description=t.description,
+                    parameters=t.parameters or {"type": "object", "properties": {}},
+                )
+            )
+
+        projection = LLMToolProjectionV1(
+            projection_id=f"proj-{uuid.uuid4().hex[:12]}",
+            catalog_id=request.tools.catalog_id,
+            health_snapshot_id=request.tools.health_snapshot_id,
+            provider_id=route.provider_id,
+            definitions=definitions,
+        )
+        return projection, sanitized_mapping
+
+    def _project_prompt_embedded_tools(
+        self,
+        request: LLMRequestV1,
+        messages: List[Dict[str, Any]],
+        projection: Optional[LLMToolProjectionV1],
+    ) -> List[Dict[str, Any]]:
+        """Enforce WP7 tool catalog scoping on prompt-embedded tool definitions (Two Tool Shapes)."""
+        if not request.tools:
+            return messages
+
+        excluded_names = set(request.tools.excluded) if request.tools.excluded else set()
+        allowed_source_names = (
+            {d.source_tool_name for d in projection.definitions}
+            if projection
+            else ({t.name for t in request.tools.tools} - excluded_names)
+        )
+
+        projected_messages: List[Dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, str):
+                projected_messages.append(msg)
+                continue
+
+            modified = False
+            # 1. JSON payload with "available_tools" (propose_gather_action shape)
+            if '"available_tools"' in content:
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("available_tools"), dict):
+                        filtered_tools = {
+                            k: v
+                            for k, v in parsed["available_tools"].items()
+                            if k in allowed_source_names and k not in excluded_names
+                        }
+                        parsed["available_tools"] = filtered_tools
+                        content = json.dumps(parsed, ensure_ascii=False)
+                        modified = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # 2. ReAct text prompt containing [可用工具] or 【可用工具】
+            if "[可用工具]" in content or "【可用工具】" in content:
+                lines = content.splitlines()
+                projected_lines: List[str] = []
+                in_tools_block = False
+                for line in lines:
+                    stripped = line.strip()
+                    if "[可用工具]" in stripped or "【可用工具】" in stripped:
+                        in_tools_block = True
+                        projected_lines.append(line)
+                        continue
+                    if in_tools_block and stripped.startswith("[") and stripped.endswith("]"):
+                        in_tools_block = False
+                    if in_tools_block and stripped.startswith("【") and stripped.endswith("】"):
+                        in_tools_block = False
+
+                    if in_tools_block:
+                        tool_bullet_match = re.match(r"^\s*\d+[\)\.]\s*([a-zA-Z0-9_\.-]+)", line)
+                        if tool_bullet_match:
+                            t_name = tool_bullet_match.group(1).rstrip(":")
+                            if t_name in excluded_names or (allowed_source_names and t_name not in allowed_source_names):
+                                modified = True
+                                continue
+                        elif any(ex in line for ex in excluded_names):
+                            modified = True
+                            continue
+                    projected_lines.append(line)
+                if modified:
+                    content = "\n".join(projected_lines)
+
+            if modified:
+                new_msg = dict(msg)
+                new_msg["content"] = content
+                projected_messages.append(new_msg)
+            else:
+                projected_messages.append(msg)
+
+        return projected_messages
+
     def _normalize_request_kwargs(
         self, request: LLMRequestV1, route: RouteV1, adaptations: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], Dict[str, str]]:
@@ -275,6 +435,13 @@ class GatewayEngine:
                 "role": "user",
                 "content": f"The previous response failed contract validation: {errors}. Please return a repaired output strictly conforming to the required schema and constraints."
             })
+
+        # Build projection and wire tools (Two tool shapes supported)
+        projection, sanitized_mapping = self._build_tool_projection(request, route)
+        self.last_tool_projection = projection
+
+        # Project prompt-embedded tools in messages (Two Tool Shapes architecture)
+        messages_wire = self._project_prompt_embedded_tools(request, messages_wire, projection)
 
         kwargs: Dict[str, Any] = {
             "model": route.model_id,
@@ -312,34 +479,28 @@ class GatewayEngine:
             if provider_cap and provider_cap.features.supports_json_object:
                 kwargs["response_format"] = {"type": "json_object"}
 
-        # Tools and tool choices
-        sanitized_mapping: Dict[str, str] = {}
-        if request.tools and request.tools.tools:
-            tools_wire = []
-            for t in request.tools.tools:
-                orig_name = t.name
-                wire_name = orig_name
-                if not _TOOL_NAME_ALLOWED_RE.match(orig_name):
-                    wire_name = re.sub(r"[^a-zA-Z0-9_-]", "_", orig_name)
-                    sanitized_mapping[wire_name] = orig_name
-                tools_wire.append(
+        # Native tools wire argument
+        if projection is not None:
+            if provider_cap is None or provider_cap.features.supports_tools:
+                kwargs["tools"] = [
                     {
                         "type": "function",
                         "function": {
-                            "name": wire_name,
-                            "description": t.description,
-                            "parameters": t.parameters or {"type": "object", "properties": {}},
+                            "name": d.llm_tool_name,
+                            "description": d.description,
+                            "parameters": d.parameters,
                         },
                     }
-                )
-            kwargs["tools"] = tools_wire
+                    for d in projection.definitions
+                ]
+
             if request.tool_choice:
                 if isinstance(request.tool_choice, str):
                     kwargs["tool_choice"] = request.tool_choice
                 elif isinstance(request.tool_choice, dict):
                     choice_func = request.tool_choice.get("function", {})
                     fn_name = choice_func.get("name", "")
-                    reverse_map = {orig: san for san, orig in sanitized_mapping.items()}
+                    reverse_map = {d.source_tool_name: d.llm_tool_name for d in projection.definitions}
                     wire_choice_name = reverse_map.get(fn_name, fn_name)
                     kwargs["tool_choice"] = {
                         "type": "function",
@@ -500,11 +661,12 @@ class GatewayEngine:
                 wire_name = fn.get("name", "")
                 orig_name = sanitized_mapping.get(wire_name, wire_name)
 
-                # Validate tool presence in scoped catalog
+                # Validate tool presence in scoped catalog and ensure not excluded
                 if request.tools:
-                    catalog_tool_names = {t.name for t in request.tools.tools}
+                    excluded_tools = set(request.tools.excluded) if request.tools.excluded else set()
+                    catalog_tool_names = {t.name for t in request.tools.tools} - excluded_tools
                     if orig_name not in catalog_tool_names:
-                        val_summary.errors.append(f"Tool '{orig_name}' not in scoped catalog")
+                        val_summary.errors.append(f"Tool '{orig_name}' not in scoped catalog or is excluded")
                         val_summary.semantic = ValidationGateStatus.FAILED
                         return ValidationGateResultV1(passed=False, summary=val_summary, payload=None)
 
@@ -552,7 +714,18 @@ class GatewayEngine:
                         f"Unknown semantic validator ID: '{contract.semantic_validator_id}' (fail-closed)"
                     )
                     return ValidationGateResultV1(passed=False, summary=val_summary, payload=None)
-                sem_ok, sem_errs = sem_validator(parsed_json, contract.validator_inputs)
+                val_inputs = dict(contract.validator_inputs or {})
+                if request.tools and contract.semantic_validator_id == SemanticValidatorId.GATHER_ACTION.value:
+                    excluded_tools = set(request.tools.excluded) if request.tools.excluded else set()
+                    allowed_from_cat = {t.name for t in request.tools.tools} - excluded_tools
+                    if "allowed_tools" in val_inputs:
+                        val_inputs["allowed_tools"] = [
+                            t for t in val_inputs["allowed_tools"] if t in allowed_from_cat
+                        ]
+                    else:
+                        val_inputs["allowed_tools"] = list(allowed_from_cat)
+
+                sem_ok, sem_errs = sem_validator(parsed_json, val_inputs)
                 if not sem_ok:
                     val_summary.semantic = ValidationGateStatus.FAILED
                     val_summary.errors.extend(sem_errs)
@@ -788,6 +961,14 @@ class GatewayEngine:
             if released_output is not None or terminal_failure:
                 break
 
+            if not self.circuit_breaker.is_available(route.provider_id, route.model_id):
+                logger.info(
+                    "Circuit breaker OPEN for %s/%s; fast-failing to next ladder route.",
+                    route.provider_id,
+                    route.model_id,
+                )
+                continue
+
             route_attempts = 0
             validation_retries = 0
             retry_kind = AttemptKind.TRANSPORT_RETRY
@@ -852,6 +1033,7 @@ class GatewayEngine:
                         is_valid = gate_res.passed and is_compat
 
                     if is_valid and gate_res.payload is not None:
+                        self.circuit_breaker.record_success(route.provider_id, route.model_id)
                         attempt = self._record_attempt(
                             request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
                             AttemptOutcome.SUCCESS, resp=raw_resp, applied_changes=adaptations.get("removed_params"),
@@ -915,6 +1097,7 @@ class GatewayEngine:
                         break
 
                 except TransportError as exc:
+                    self.circuit_breaker.record_failure(route.provider_id, route.model_id)
                     lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
                     attempt = self._record_attempt(
                         request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
@@ -980,6 +1163,14 @@ class GatewayEngine:
             if released_output is not None or terminal_failure:
                 break
 
+            if not self.circuit_breaker.is_available(route.provider_id, route.model_id):
+                logger.info(
+                    "Circuit breaker OPEN for %s/%s; fast-failing to next ladder route.",
+                    route.provider_id,
+                    route.model_id,
+                )
+                continue
+
             route_attempts = 0
             validation_retries = 0
             retry_kind = AttemptKind.TRANSPORT_RETRY
@@ -1042,6 +1233,7 @@ class GatewayEngine:
                         is_valid = gate_res.passed and is_compat
 
                     if is_valid and gate_res.payload is not None:
+                        self.circuit_breaker.record_success(route.provider_id, route.model_id)
                         attempt = self._record_attempt(
                             request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
                             AttemptOutcome.SUCCESS, resp=raw_resp, applied_changes=adaptations.get("removed_params"),
@@ -1105,6 +1297,7 @@ class GatewayEngine:
                         break
 
                 except TransportError as exc:
+                    self.circuit_breaker.record_failure(route.provider_id, route.model_id)
                     lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
                     attempt = self._record_attempt(
                         request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
@@ -1217,6 +1410,136 @@ class GatewayEngine:
         from functools import partial
         call_fn = partial(self.invoke_llm, request, validator_hook=validator_hook)
         return await loop.run_in_executor(executor, call_fn)
+
+    def invoke_llm_stream(
+        self,
+        request: LLMRequestV1,
+    ):
+        """Synchronously stream delta tokens for an LLMRequestV1 across route ladder."""
+        initial_route, initial_leg = self._determine_initial_route(request)
+        route_ladder = self._build_route_ladder(request, initial_route, initial_leg)
+        adaptations: Dict[str, Any] = {"removed_params": []}
+        attempt_count = 0
+        last_error = None
+
+        for route, leg in route_ladder:
+            if not self.circuit_breaker.is_available(route.provider_id, route.model_id):
+                continue
+
+            attempt_count += 1
+            att_kind = AttemptKind.INITIAL if attempt_count == 1 else AttemptKind.ROUTE_FALLBACK
+            att_start_utc = time.time()
+            att_start_mono = time.monotonic()
+            adapter = self.get_adapter(route.provider_id)
+            kwargs, _ = self._normalize_request_kwargs(request, route, adaptations)
+
+            collected_tokens = 0
+            full_text_chunks = []
+            stream_started = False
+            try:
+                for chunk in adapter.execute_stream(request, route, kwargs):
+                    stream_started = True
+                    collected_tokens += 1
+                    full_text_chunks.append(chunk)
+                    yield chunk
+
+                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                raw_resp = RawAdapterResponse(
+                    text="".join(full_text_chunks),
+                    prompt_tokens=40,
+                    completion_tokens=collected_tokens,
+                    total_tokens=40 + collected_tokens,
+                    is_usage_reported=True,
+                    http_status=HTTP_STATUS_OK,
+                    model=route.model_id,
+                )
+                self._record_attempt(
+                    request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
+                    AttemptOutcome.SUCCESS, resp=raw_resp, applied_changes=adaptations.get("removed_params")
+                )
+                self.circuit_breaker.record_success(route.provider_id, route.model_id)
+                return
+            except Exception as exc:
+                last_error = exc
+                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                if isinstance(exc, TransportError):
+                    self.circuit_breaker.record_failure(route.provider_id, route.model_id)
+                self._record_attempt(
+                    request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
+                    AttemptOutcome.TRANSPORT_ERROR if isinstance(exc, TransportError) else AttemptOutcome.PROVIDER_ERROR,
+                    error=exc
+                )
+                if stream_started:
+                    raise
+                continue
+
+        if last_error:
+            raise last_error
+
+    async def invoke_llm_stream_async(
+        self,
+        request: LLMRequestV1,
+    ):
+        """Asynchronously stream delta tokens for an LLMRequestV1 across route ladder."""
+        initial_route, initial_leg = self._determine_initial_route(request)
+        route_ladder = self._build_route_ladder(request, initial_route, initial_leg)
+        adaptations: Dict[str, Any] = {"removed_params": []}
+        attempt_count = 0
+        last_error = None
+
+        for route, leg in route_ladder:
+            if not self.circuit_breaker.is_available(route.provider_id, route.model_id):
+                continue
+
+            attempt_count += 1
+            att_kind = AttemptKind.INITIAL if attempt_count == 1 else AttemptKind.ROUTE_FALLBACK
+            att_start_utc = time.time()
+            att_start_mono = time.monotonic()
+            adapter = self.get_adapter(route.provider_id)
+            kwargs, _ = self._normalize_request_kwargs(request, route, adaptations)
+
+            collected_tokens = 0
+            full_text_chunks = []
+            stream_started = False
+            try:
+                async for chunk in adapter.execute_stream_async(request, route, kwargs):
+                    stream_started = True
+                    collected_tokens += 1
+                    full_text_chunks.append(chunk)
+                    yield chunk
+
+                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                raw_resp = RawAdapterResponse(
+                    text="".join(full_text_chunks),
+                    prompt_tokens=40,
+                    completion_tokens=collected_tokens,
+                    total_tokens=40 + collected_tokens,
+                    is_usage_reported=True,
+                    http_status=HTTP_STATUS_OK,
+                    model=route.model_id,
+                )
+                self._record_attempt(
+                    request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
+                    AttemptOutcome.SUCCESS, resp=raw_resp, applied_changes=adaptations.get("removed_params")
+                )
+                self.circuit_breaker.record_success(route.provider_id, route.model_id)
+                return
+            except Exception as exc:
+                last_error = exc
+                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                if isinstance(exc, TransportError):
+                    self.circuit_breaker.record_failure(route.provider_id, route.model_id)
+                self._record_attempt(
+                    request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
+                    AttemptOutcome.TRANSPORT_ERROR if isinstance(exc, TransportError) else AttemptOutcome.PROVIDER_ERROR,
+                    error=exc
+                )
+                if stream_started:
+                    raise
+                continue
+
+        if last_error:
+            raise last_error
 
     def _build_result(
         self,
@@ -1375,4 +1698,15 @@ async def invoke_llm_in_executor(
     block the event loop.
     """
     return await _GLOBAL_ENGINE.invoke_llm_in_executor(request, validator_hook=validator_hook, executor=executor)
+
+
+def invoke_llm_stream(request: LLMRequestV1):
+    """Public synchronous streaming entry point for LLM Gateway."""
+    return _GLOBAL_ENGINE.invoke_llm_stream(request)
+
+
+async def invoke_llm_stream_async(request: LLMRequestV1):
+    """Public asynchronous streaming entry point for LLM Gateway."""
+    async for chunk in _GLOBAL_ENGINE.invoke_llm_stream_async(request):
+        yield chunk
 

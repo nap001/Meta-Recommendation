@@ -98,7 +98,7 @@ class UsageLedger:
             "prompt_tokens": sum(e.prompt_tokens for e in self.events),
             "completion_tokens": sum(e.completion_tokens for e in self.events),
             "total_tokens": sum(e.total_tokens for e in self.events),
-            "cost_usd": round(sum(e.cost_usd for e in self.events), 6),
+            "cost_usd": round(sum(e.cost_usd for e in self.events), 8),
         }
 
 
