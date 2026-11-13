@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from llm_gateway.constants import (
     DEFAULT_CURRENCY,
+    DEFAULT_PRICE_TABLE_VERSION,
     DEFAULT_PRICING_SNAPSHOT_ID,
     TOKENS_PER_MILLION,
 )
@@ -15,6 +16,7 @@ from llm_gateway.constants import (
 class ModelPriceV1(BaseModel):
     input_price_per_1m: float = 0.0
     output_price_per_1m: float = 0.0
+    price_table_version: str = DEFAULT_PRICE_TABLE_VERSION
 
 
 class PricingSnapshotV1(BaseModel):

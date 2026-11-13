@@ -29,7 +29,7 @@ class ModelLimitV1(BaseModel):
 class ProviderFeaturesV1(BaseModel):
     supports_sync: bool = True
     supports_async: bool = True
-    supports_streaming: bool = False
+    supports_streaming: bool = True
     supports_json_object: bool = True
     supports_json_schema: bool = True
     supports_tools: bool = True

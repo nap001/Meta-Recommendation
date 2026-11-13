@@ -68,7 +68,7 @@ class ProviderRegistry:
             features=ProviderFeaturesV1(
                 supports_sync=True,
                 supports_async=True,
-                supports_streaming=False,
+                supports_streaming=True,
                 supports_json_object=True,
                 supports_json_schema=True,
                 supports_tools=True,
@@ -94,7 +94,7 @@ class ProviderRegistry:
             features=ProviderFeaturesV1(
                 supports_sync=True,
                 supports_async=True,
-                supports_streaming=False,  # Fix #5: no adapter implements streaming yet
+                supports_streaming=True,
                 supports_json_object=True,
                 supports_json_schema=False,
                 supports_tools=True,
@@ -137,7 +137,7 @@ class ProviderRegistry:
             features=ProviderFeaturesV1(
                 supports_sync=True,
                 supports_async=True,
-                supports_streaming=False,  # Fix #5: no adapter implements streaming yet
+                supports_streaming=True,
                 supports_json_object=True,
                 supports_json_schema=True,
                 supports_tools=True,
@@ -163,7 +163,7 @@ class ProviderRegistry:
             features=ProviderFeaturesV1(
                 supports_sync=True,
                 supports_async=True,
-                supports_streaming=False,  # Fix #5: no adapter implements streaming yet
+                supports_streaming=True,
                 supports_json_object=True,
                 supports_json_schema=True,
                 supports_tools=True,
@@ -191,7 +191,7 @@ class ProviderRegistry:
             features=ProviderFeaturesV1(
                 supports_sync=True,
                 supports_async=True,
-                supports_streaming=False,  # Fix #5: no adapter implements streaming yet
+                supports_streaming=True,
                 supports_json_object=True,
                 supports_json_schema=False,
                 supports_tools=True,

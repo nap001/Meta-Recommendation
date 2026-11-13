@@ -69,8 +69,23 @@ class BudgetExhaustedError(LLMErrorV1):
 
 
 class TransportError(LLMErrorV1):
-    def __init__(self, code: str, message: str, *, retryable: bool = True, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = True,
+        retry_after_seconds: Optional[float] = None,
+        http_status: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(code, ErrorClass.TRANSPORT, message, retryable=retryable, **kwargs)
+        self.retry_after_seconds = retry_after_seconds
+        self.http_status = http_status
+        if retry_after_seconds is not None:
+            self.details.setdefault("retry_after_seconds", retry_after_seconds)
+        if http_status is not None:
+            self.details.setdefault("http_status", http_status)
 
 
 class CompatibilityError(LLMErrorV1):

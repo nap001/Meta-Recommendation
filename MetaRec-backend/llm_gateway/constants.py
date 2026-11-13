@@ -47,19 +47,47 @@ class CredentialStatus(str, Enum):
 
 class GatewayErrorCode(str, Enum):
     """Standardized error taxonomy code strings."""
-    RATE_LIMITED = "rate_limited"
-    TIMEOUT = "timeout"
-    CONNECT_ERROR = "connect_error"
-    PROVIDER_5XX = "provider_5xx"
-    UNSUPPORTED_PARAMETER = "unsupported_parameter"
-    AUTH_FAILED = "auth_failed"
+    # Request class
     INVALID_REQUEST = "invalid_request"
-    PROVIDER_ERROR = "provider_error"
-    VALIDATION_FAILED = "validation_failed"
+    UNKNOWN_SCHEMA = "unknown_schema"
+    INVALID_TOOL_SCOPE = "invalid_tool_scope"
+    # Policy class
+    UNSAFE_SITE = "unsafe_site"
+    PROVIDER_NOT_ALLOWED = "provider_not_allowed"
+    CAPABILITY_MISMATCH = "capability_mismatch"
+    PRIVACY_POLICY_MISMATCH = "privacy_policy_mismatch"
+    # Budget class
     DEADLINE_EXHAUSTED = "deadline_exhausted"
     ATTEMPT_BUDGET_EXHAUSTED = "attempt_budget_exhausted"
+    TOKEN_BUDGET_EXHAUSTED = "token_budget_exhausted"
     COST_BUDGET_EXHAUSTED = "cost_budget_exhausted"
+    # Transport class
+    CONNECT_ERROR = "connect_error"
+    TIMEOUT = "timeout"
+    RATE_LIMITED = "rate_limited"
+    PROVIDER_5XX = "provider_5xx"
+    # Compatibility class
+    UNSUPPORTED_PARAMETER = "unsupported_parameter"
+    UNSUPPORTED_RESPONSE_FORMAT = "unsupported_response_format"
+    UNSUPPORTED_TOOLS = "unsupported_tools"
+    # Validation class
+    VALIDATION_FAILED = "validation_failed"
+    MALFORMED_JSON = "malformed_json"
+    JSON_SCHEMA_VIOLATION = "json_schema_violation"
+    SEMANTIC_VIOLATION = "semantic_violation"
+    INVALID_TOOL_CALL = "invalid_tool_call"
+    # Provider class
+    AUTH_FAILED = "auth_failed"
+    PROVIDER_4XX = "provider_4xx"
+    PROVIDER_ERROR = "provider_error"
+    CONTENT_BLOCKED = "content_blocked"
+    EMPTY_RESPONSE = "empty_response"
+    USAGE_MISSING = "usage_missing"
     CONFIGURATION_ERROR = "configuration_error"
+    # Internal / Control class
+    ADAPTER_ERROR = "adapter_error"
+    VALIDATOR_ERROR = "validator_error"
+    CANCELLED = "cancelled"
     UNKNOWN_FAILURE = "unknown_failure"
     KILL_SWITCH_ACTIVE = "kill_switch_active"
 
@@ -184,15 +212,58 @@ DEFAULT_LITELLM_CATALOG_URL: str = (
 
 
 # ---------------------------------------------------------------------------
-# Policy Tags
+# Policy Tags & Safety Context Producers
 # ---------------------------------------------------------------------------
 
 POLICY_TAG_CONVERSATION_SUMMARY: str = "conversation.summary"
 POLICY_TAG_CONFIRMATION_PAYLOAD: str = "confirmation.payload"
+POLICY_TAG_GATHER_ACTION: str = "gather.propose_action"
+POLICY_TAG_INTENT_ANALYZE: str = "intent.analyze_message"
+POLICY_TAG_ITINERARY_CONSTRAINTS: str = "itinerary.extract_constraints"
+POLICY_TAG_ITINERARY_DURATIONS: str = "itinerary.enrich_durations"
+POLICY_TAG_ITINERARY_ROLES: str = "itinerary.classify_roles"
+POLICY_TAG_ITINERARY_CONTAINMENT: str = "itinerary.classify_containment"
+POLICY_TAG_ITINERARY_REPAIR: str = "itinerary.propose_repair"
+POLICY_TAG_AGENT_PLAN: str = "agent.restaurant_plan"
+POLICY_TAG_AGENT_SUMMARY: str = "agent.restaurant_summary"
+
 CHEAP_ROUTE_ELIGIBLE_TAGS: frozenset[str] = frozenset({
     POLICY_TAG_CONVERSATION_SUMMARY,
     POLICY_TAG_CONFIRMATION_PAYLOAD,
 })
+
+NEVER_CHEAP_ROUTE_TAGS: frozenset[str] = frozenset({
+    POLICY_TAG_GATHER_ACTION,
+    POLICY_TAG_INTENT_ANALYZE,
+    POLICY_TAG_ITINERARY_CONSTRAINTS,
+    POLICY_TAG_ITINERARY_DURATIONS,
+    POLICY_TAG_ITINERARY_ROLES,
+    POLICY_TAG_ITINERARY_CONTAINMENT,
+    POLICY_TAG_ITINERARY_REPAIR,
+    POLICY_TAG_AGENT_PLAN,
+    POLICY_TAG_AGENT_SUMMARY,
+})
+
+PRODUCER_ID_SUMMARY_SAFETY: str = "summary_safety_context.v1"
+PRODUCER_ID_CONFIRMATION_CONTEXT: str = "confirmation_context.v1"
+
+REGISTERED_CONTEXT_PRODUCERS: frozenset[str] = frozenset({
+    DEFAULT_PRODUCER_ID,
+    PRODUCER_ID_SUMMARY_SAFETY,
+    PRODUCER_ID_CONFIRMATION_CONTEXT,
+    "test_producer",
+    "test",
+})
+
+REGISTERED_CONTEXT_VERSIONS: frozenset[str] = frozenset({
+    DEFAULT_CONTEXT_VERSION,
+    "v1",
+    PRODUCER_ID_SUMMARY_SAFETY,
+    PRODUCER_ID_CONFIRMATION_CONTEXT,
+})
+
+DEFAULT_CONTEXT_MAX_AGE_SECONDS: float = 300.0
+DEFAULT_CONTEXT_MAX_FUTURE_SKEW_SECONDS: float = 5.0
 
 
 # ---------------------------------------------------------------------------
