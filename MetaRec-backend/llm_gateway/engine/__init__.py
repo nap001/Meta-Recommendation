@@ -14,6 +14,7 @@ from llm_gateway.engine.factories import (
     invoke_llm_stream_async,
 )
 from llm_gateway.engine.resilience import (
+    FakeClock,
     RouteCircuitBreaker,
     _BACKOFF_BASE_MS,
     _BACKOFF_CAP_MS,
@@ -31,6 +32,7 @@ __all__ = [
     "invoke_llm_in_executor",
     "invoke_llm_stream",
     "invoke_llm_stream_async",
+    "FakeClock",
     "RouteCircuitBreaker",
     "_jitter_sleep_seconds",
     "_BACKOFF_BASE_MS",

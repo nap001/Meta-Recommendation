@@ -6,7 +6,7 @@ import logging
 import math
 import random
 import time
-from typing import Dict, Tuple
+from typing import Callable, Dict, List, Tuple
 
 from llm_gateway.constants import (
     DEFAULT_BACKOFF_BASE_MS,
@@ -36,12 +36,57 @@ def _jitter_sleep_seconds(attempt_number: int) -> float:
     return sleep_ms / MS_PER_SECOND
 
 
+class FakeClock:
+    """Deterministic virtual clock for testing retry back-off, deadlines, and circuit breakers in 0ms real time."""
+
+    def __init__(
+        self,
+        initial_utc: float = 1_700_000_000.0,
+        initial_monotonic: float = 1_000.0,
+    ) -> None:
+        self._utc = float(initial_utc)
+        self._monotonic = float(initial_monotonic)
+        self.sleep_history: List[float] = []
+
+    def time(self) -> float:
+        """Return current virtual wall-clock UTC timestamp in seconds."""
+        return self._utc
+
+    def monotonic(self) -> float:
+        """Return current virtual monotonic timestamp in seconds."""
+        return self._monotonic
+
+    def advance(self, seconds: float) -> None:
+        """Advance both monotonic and UTC clocks by ``seconds``."""
+        delta = max(0.0, float(seconds))
+        self._monotonic += delta
+        self._utc += delta
+
+    def sleep(self, seconds: float) -> None:
+        """Record a synchronous sleep and advance virtual time immediately."""
+        duration = max(0.0, float(seconds))
+        self.sleep_history.append(duration)
+        self.advance(duration)
+
+    async def async_sleep(self, seconds: float) -> None:
+        """Record an asynchronous sleep and advance virtual time immediately."""
+        duration = max(0.0, float(seconds))
+        self.sleep_history.append(duration)
+        self.advance(duration)
+
+
 class RouteCircuitBreaker:
     """Automated circuit breaker per (provider_id, model_id) to prevent cascading outage storms."""
 
-    def __init__(self, failure_threshold: int = 5, recovery_timeout_sec: float = 30.0) -> None:
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout_sec: float = 30.0,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.failure_threshold = failure_threshold
         self.recovery_timeout_sec = recovery_timeout_sec
+        self._monotonic_fn = monotonic_fn
         self._failures: Dict[Tuple[str, str], int] = {}
         self._opened_at: Dict[Tuple[str, str], float] = {}
 
@@ -50,7 +95,7 @@ class RouteCircuitBreaker:
         opened = self._opened_at.get(key)
         if opened is None:
             return True
-        if time.monotonic() - opened > self.recovery_timeout_sec:
+        if self._monotonic_fn() - opened > self.recovery_timeout_sec:
             return True  # Half-open probe attempt
         return False
 
@@ -58,7 +103,7 @@ class RouteCircuitBreaker:
         key = (provider_id, model_id)
         self._failures[key] = self._failures.get(key, 0) + 1
         if self._failures[key] >= self.failure_threshold:
-            self._opened_at[key] = time.monotonic()
+            self._opened_at[key] = self._monotonic_fn()
             logger.warning(
                 "Circuit breaker tripped OPEN for %s/%s after %d consecutive failures.",
                 provider_id,

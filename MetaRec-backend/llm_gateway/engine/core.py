@@ -46,7 +46,12 @@ from llm_gateway.engine.projection import (
     normalize_request_kwargs,
     project_prompt_embedded_tools,
 )
-from llm_gateway.engine.resilience import RouteCircuitBreaker, _MAX_ATTEMPTS_PER_ROUTE
+from llm_gateway.engine.resilience import (
+    FakeClock,
+    RouteCircuitBreaker,
+    _MAX_ATTEMPTS_PER_ROUTE,
+    _jitter_sleep_seconds,
+)
 from llm_gateway.engine.result_builder import build_result
 from llm_gateway.engine.routing import build_route_ladder, determine_initial_route
 from llm_gateway.engine.stream import run_stream_async, run_stream_sync
@@ -69,16 +74,39 @@ class GatewayEngine:
     Fix #3: Constructor accepts an optional ``registry`` so isolated engine
     instances can be created for testing without mutating the global singleton.
     Use ``create_engine()`` or ``create_engine_for_registry()`` factories.
+    Supports an injectable ``clock`` (such as ``FakeClock``) or individual
+    timing/sleep functions for deterministic retry back-off and deadline tests.
     """
 
     def __init__(
         self,
         registry: Optional[ProviderRegistry] = None,
         validator_hook: Optional[Callable[..., Any]] = None,
+        clock: Optional[Any] = None,
+        monotonic_fn: Optional[Callable[[], float]] = None,
+        time_fn: Optional[Callable[[], float]] = None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+        async_sleep_fn: Optional[Callable[[float], Any]] = None,
+        jitter_fn: Optional[Callable[[int], float]] = None,
     ) -> None:
         self.registry = registry or get_provider_registry()
         self.validator_hook = validator_hook
-        self.circuit_breaker = RouteCircuitBreaker()
+        self.clock = clock
+        self._monotonic_fn: Callable[[], float] = (
+            monotonic_fn or (getattr(clock, "monotonic", None) if clock is not None else None) or time.monotonic
+        )
+        self._time_fn: Callable[[], float] = (
+            time_fn or (getattr(clock, "time", None) if clock is not None else None) or time.time
+        )
+        self._sleep_fn: Callable[[float], None] = (
+            sleep_fn or (getattr(clock, "sleep", None) if clock is not None else None) or time.sleep
+        )
+        self._async_sleep_fn: Callable[[float], Any] = (
+            async_sleep_fn or (getattr(clock, "async_sleep", None) if clock is not None else None) or asyncio.sleep
+        )
+        self._jitter_fn: Callable[[int], float] = jitter_fn or _jitter_sleep_seconds
+
+        self.circuit_breaker = RouteCircuitBreaker(monotonic_fn=self._monotonic_fn)
         # Optional per-engine override of the module-level per-route attempt cap.
         self.max_attempts_per_route: Optional[int] = None
         self._adapters: Dict[str, BaseLLMAdapter] = {
@@ -122,7 +150,7 @@ class GatewayEngine:
         return adapter
 
     def _determine_initial_route(self, request: LLMRequestV1) -> Tuple[RouteV1, PolicyLeg]:
-        return determine_initial_route(request)
+        return determine_initial_route(request, now_utc=self._time_fn())
 
     def _build_route_ladder(
         self, request: LLMRequestV1, initial_route: RouteV1, initial_leg: PolicyLeg
@@ -257,6 +285,8 @@ class GatewayEngine:
                 request, route_ladder, initial_route, initial_leg, start_time_monotonic,
                 self.get_adapter, self.circuit_breaker, self.registry, self._route_attempt_cap(),
                 validator_hook=validator_hook, engine_validator_hook=self.validator_hook,
+                monotonic_fn=self._monotonic_fn, time_fn=self._time_fn,
+                sleep_fn=self._sleep_fn, jitter_fn=self._jitter_fn,
             )
         )
         if last_proj is not None:
@@ -284,6 +314,8 @@ class GatewayEngine:
                 request, route_ladder, initial_route, initial_leg, start_time_monotonic,
                 self.get_adapter, self.circuit_breaker, self.registry, self._route_attempt_cap(),
                 validator_hook=validator_hook, engine_validator_hook=self.validator_hook,
+                monotonic_fn=self._monotonic_fn, time_fn=self._time_fn,
+                async_sleep_fn=self._async_sleep_fn, jitter_fn=self._jitter_fn,
             )
         )
         if last_proj is not None:
@@ -296,8 +328,8 @@ class GatewayEngine:
         validator_hook: Optional[Callable[..., Any]] = None,
     ) -> LLMResultV1:
         """Synchronous execution of LLMRequestV1 across provider route ladder."""
-        start_time_monotonic = time.monotonic()
-        start_time_utc = time.time()
+        start_time_monotonic = self._monotonic_fn()
+        start_time_utc = self._time_fn()
         deadline_ms = request.budget.deadline_ms
 
         initial_route, initial_leg = self._determine_initial_route(request)
@@ -321,8 +353,8 @@ class GatewayEngine:
         validator_hook: Optional[Callable[..., Any]] = None,
     ) -> LLMResultV1:
         """Asynchronous execution of LLMRequestV1 across provider route ladder."""
-        start_time_monotonic = time.monotonic()
-        start_time_utc = time.time()
+        start_time_monotonic = self._monotonic_fn()
+        start_time_utc = self._time_fn()
         deadline_ms = request.budget.deadline_ms
 
         initial_route, initial_leg = self._determine_initial_route(request)
@@ -381,4 +413,5 @@ class GatewayEngine:
         return build_result(
             request, attempts, released_output, selected_route, final_val_summary,
             degradation, last_error, start_time_utc, start_time_monotonic, deadline_ms,
+            monotonic_fn=self._monotonic_fn, time_fn=self._time_fn,
         )

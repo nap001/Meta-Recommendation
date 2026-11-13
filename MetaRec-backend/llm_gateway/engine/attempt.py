@@ -33,6 +33,7 @@ from llm_gateway.errors import (
     CompatibilityError,
     LLMErrorV1,
     OutputValidationError,
+    PolicyViolationError,
     ProviderError,
     TransportError,
 )
@@ -84,8 +85,16 @@ def record_attempt(
         t_tokens = getattr(error, "total_tokens", None)
         is_usage_reported = p_tokens is not None
 
+    provider_cap = registry.get_provider(route.provider_id)
+    rate_entry = pricing.get_price(route.provider_id, route.model_id)
+    resolved_price_table_version = (
+        provider_cap.price_table_version
+        if provider_cap is not None
+        else getattr(rate_entry, "price_table_version", pricing.pricing_snapshot_id)
+    )
+
     if is_usage_reported and p_tokens is not None and c_tokens is not None:
-        if registry.get_provider(route.provider_id) is None:
+        if provider_cap is None:
             # Unregistered provider: keep existing LLM_PRICE_* env price table
             from llm_usage import estimate_cost
             cost_usd = estimate_cost(route.model_id, p_tokens, c_tokens)
@@ -120,7 +129,7 @@ def record_attempt(
         total_tokens=t_tokens if is_usage_reported else None,
         is_usage_reported=is_usage_reported,
         cost_usd=cost_usd,
-        price_table_version=pricing.pricing_snapshot_id,
+        price_table_version=resolved_price_table_version,
         applied_compatibility_changes=applied_changes or [],
         error_code=error_code,
         error_message=error_msg,
@@ -149,7 +158,7 @@ def record_attempt(
                 policy_leg=leg.value,
                 attempt_kind=attempt_kind.value,
                 pricing_snapshot_id=request.pricing_snapshot_id,
-                price_table_version=pricing.pricing_snapshot_id,
+                price_table_version=resolved_price_table_version,
                 is_usage_reported=is_usage_reported,
             )
             ledger.add(event)  # idempotent on attempt_id
@@ -179,6 +188,10 @@ def run_attempt_loop_sync(
     route_attempt_cap: int,
     validator_hook: Optional[Callable[..., Any]] = None,
     engine_validator_hook: Optional[Callable[..., Any]] = None,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    time_fn: Callable[[], float] = time.time,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    jitter_fn: Callable[[int], float] = _jitter_sleep_seconds,
 ) -> Tuple[
     List[PhysicalAttemptV1],
     Optional[OutputPayloadV1],
@@ -206,6 +219,32 @@ def run_attempt_loop_sync(
         if released_output is not None or terminal_failure:
             break
 
+        if request.routing_policy.allowed_provider_ids and route.provider_id not in request.routing_policy.allowed_provider_ids:
+            last_error = PolicyViolationError(
+                GatewayErrorCode.PROVIDER_NOT_ALLOWED.value,
+                f"Provider '{route.provider_id}' is not in allowed_provider_ids: {request.routing_policy.allowed_provider_ids}",
+            )
+            continue
+
+        prov_cap = registry.get_provider(route.provider_id)
+        if prov_cap is not None and not prov_cap.enabled:
+            last_error = PolicyViolationError(
+                GatewayErrorCode.CAPABILITY_MISMATCH.value,
+                f"Provider '{route.provider_id}' is disabled in capability registry",
+            )
+            continue
+
+        if (
+            request.privacy.data_class == "restricted"
+            and prov_cap is not None
+            and prov_cap.data_policy_ref not in ("zero_data_retention", "restricted_approved")
+        ):
+            last_error = PolicyViolationError(
+                GatewayErrorCode.PRIVACY_POLICY_MISMATCH.value,
+                f"Provider '{route.provider_id}' data policy '{prov_cap.data_policy_ref}' incompatible with data_class='restricted'",
+            )
+            continue
+
         if not circuit_breaker.is_available(route.provider_id, route.model_id):
             logger.info(
                 "Circuit breaker OPEN for %s/%s; fast-failing to next ladder route.",
@@ -218,9 +257,10 @@ def run_attempt_loop_sync(
         validation_retries = 0
         retry_kind = AttemptKind.TRANSPORT_RETRY
         while route_attempts < route_attempt_cap:
-            elapsed_ms = (time.monotonic() - start_time_monotonic) * MS_PER_SECOND
+            elapsed_ms = (monotonic_fn() - start_time_monotonic) * MS_PER_SECOND
             if elapsed_ms >= deadline_ms:
                 last_error = BudgetExhaustedError(GatewayErrorCode.DEADLINE_EXHAUSTED.value, f"Request deadline of {deadline_ms}ms exceeded")
+                terminal_failure = True
                 break
 
             if attempt_count >= request.budget.max_physical_attempts:
@@ -228,6 +268,7 @@ def run_attempt_loop_sync(
                     GatewayErrorCode.ATTEMPT_BUDGET_EXHAUSTED.value,
                     f"Max physical attempts ({request.budget.max_physical_attempts}) reached",
                 )
+                terminal_failure = True
                 break
 
             total_cost_so_far = sum(a.cost_usd for a in attempts)
@@ -235,6 +276,7 @@ def run_attempt_loop_sync(
                 last_error = BudgetExhaustedError(
                     GatewayErrorCode.COST_BUDGET_EXHAUSTED.value, f"Max cost budget ${request.budget.max_cost_usd} exceeded"
                 )
+                terminal_failure = True
                 break
 
             total_tokens_so_far = sum(a.total_tokens for a in attempts if a.total_tokens is not None)
@@ -243,6 +285,16 @@ def run_attempt_loop_sync(
                     GatewayErrorCode.TOKEN_BUDGET_EXHAUSTED.value,
                     f"Max total tokens budget {request.budget.max_total_tokens} exceeded (consumed {total_tokens_so_far})",
                 )
+                terminal_failure = True
+                break
+
+            prompt_tokens_so_far = sum(a.prompt_tokens for a in attempts if a.prompt_tokens is not None)
+            if request.budget.max_input_tokens and prompt_tokens_so_far >= request.budget.max_input_tokens:
+                last_error = BudgetExhaustedError(
+                    GatewayErrorCode.TOKEN_BUDGET_EXHAUSTED.value,
+                    f"Max input tokens budget {request.budget.max_input_tokens} exceeded (consumed {prompt_tokens_so_far})",
+                )
+                terminal_failure = True
                 break
 
             attempt_count += 1
@@ -251,8 +303,8 @@ def run_attempt_loop_sync(
                 AttemptKind.ROUTE_FALLBACK if route_attempts == 1 else retry_kind
             )
 
-            att_start_utc = time.time()
-            att_start_mono = time.monotonic()
+            att_start_utc = time_fn()
+            att_start_mono = monotonic_fn()
             adapter = get_adapter(route.provider_id)
             kwargs, san_mapping, proj = normalize_request_kwargs(request, route, adaptations, registry)
             last_projection = proj
@@ -262,7 +314,7 @@ def run_attempt_loop_sync(
 
             try:
                 raw_resp = adapter.execute(request, route, kwargs)
-                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                lat_ms = (monotonic_fn() - att_start_mono) * MS_PER_SECOND
 
                 # Fix #8: log response only when allowed
                 log_privacy_safe(request, "RESPONSE", raw_resp.text or "")
@@ -329,7 +381,7 @@ def run_attempt_loop_sync(
                     break  # Fall back to next route in ladder unless terminal failure
 
             except CompatibilityError as exc:
-                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                lat_ms = (monotonic_fn() - att_start_mono) * MS_PER_SECOND
                 attempt = record_attempt(
                     registry, request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
                     AttemptOutcome.COMPATIBILITY_ERROR, error=exc
@@ -346,7 +398,7 @@ def run_attempt_loop_sync(
 
             except TransportError as exc:
                 circuit_breaker.record_failure(route.provider_id, route.model_id)
-                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                lat_ms = (monotonic_fn() - att_start_mono) * MS_PER_SECOND
                 attempt = record_attempt(
                     registry, request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
                     AttemptOutcome.TRANSPORT_ERROR, error=exc
@@ -354,18 +406,38 @@ def run_attempt_loop_sync(
                 attempts.append(attempt)
                 last_error = exc
                 retry_kind = AttemptKind.TRANSPORT_RETRY
-                # Fix #1: exponential back-off with full jitter
-                sleep_sec = _jitter_sleep_seconds(route_attempts)
+                # Fix #1: exponential back-off with full jitter and Retry-After check before sleeping
+                sleep_sec = jitter_fn(route_attempts)
+                retry_after = getattr(exc, "retry_after_seconds", None)
+                if retry_after is None and isinstance(getattr(exc, "details", None), dict):
+                    retry_after = exc.details.get("retry_after_seconds")
+                if retry_after is not None:
+                    try:
+                        sleep_sec = max(sleep_sec, float(retry_after))
+                    except (TypeError, ValueError):
+                        pass
+
+                elapsed_after_ms = (monotonic_fn() - start_time_monotonic) * MS_PER_SECOND
+                if elapsed_after_ms + (sleep_sec * MS_PER_SECOND) >= deadline_ms:
+                    if sleep_fn is not time.sleep:
+                        sleep_fn(sleep_sec)
+                    last_error = BudgetExhaustedError(
+                        GatewayErrorCode.DEADLINE_EXHAUSTED.value,
+                        f"Request deadline of {deadline_ms}ms exceeded before retry sleep ({sleep_sec * MS_PER_SECOND:.0f}ms)",
+                    )
+                    terminal_failure = True
+                    break
+
                 logger.debug(
                     "TransportError on attempt %d/%d; sleeping %.0f ms before retry (Fix #1 jitter).",
                     attempt_count,
                     request.budget.max_physical_attempts,
                     sleep_sec * MS_PER_SECOND,
                 )
-                time.sleep(sleep_sec)
+                sleep_fn(sleep_sec)
 
             except Exception as exc:
-                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                lat_ms = (monotonic_fn() - att_start_mono) * MS_PER_SECOND
                 pe = ProviderError(GatewayErrorCode.PROVIDER_ERROR.value, str(exc))
                 attempt = record_attempt(
                     registry, request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
@@ -390,6 +462,10 @@ async def run_attempt_loop_async(
     route_attempt_cap: int,
     validator_hook: Optional[Callable[..., Any]] = None,
     engine_validator_hook: Optional[Callable[..., Any]] = None,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    time_fn: Callable[[], float] = time.time,
+    async_sleep_fn: Callable[[float], Any] = asyncio.sleep,
+    jitter_fn: Callable[[int], float] = _jitter_sleep_seconds,
 ) -> Tuple[
     List[PhysicalAttemptV1],
     Optional[OutputPayloadV1],
@@ -417,6 +493,32 @@ async def run_attempt_loop_async(
         if released_output is not None or terminal_failure:
             break
 
+        if request.routing_policy.allowed_provider_ids and route.provider_id not in request.routing_policy.allowed_provider_ids:
+            last_error = PolicyViolationError(
+                GatewayErrorCode.PROVIDER_NOT_ALLOWED.value,
+                f"Provider '{route.provider_id}' is not in allowed_provider_ids: {request.routing_policy.allowed_provider_ids}",
+            )
+            continue
+
+        prov_cap = registry.get_provider(route.provider_id)
+        if prov_cap is not None and not prov_cap.enabled:
+            last_error = PolicyViolationError(
+                GatewayErrorCode.CAPABILITY_MISMATCH.value,
+                f"Provider '{route.provider_id}' is disabled in capability registry",
+            )
+            continue
+
+        if (
+            request.privacy.data_class == "restricted"
+            and prov_cap is not None
+            and prov_cap.data_policy_ref not in ("zero_data_retention", "restricted_approved")
+        ):
+            last_error = PolicyViolationError(
+                GatewayErrorCode.PRIVACY_POLICY_MISMATCH.value,
+                f"Provider '{route.provider_id}' data policy '{prov_cap.data_policy_ref}' incompatible with data_class='restricted'",
+            )
+            continue
+
         if not circuit_breaker.is_available(route.provider_id, route.model_id):
             logger.info(
                 "Circuit breaker OPEN for %s/%s; fast-failing to next ladder route.",
@@ -429,9 +531,10 @@ async def run_attempt_loop_async(
         validation_retries = 0
         retry_kind = AttemptKind.TRANSPORT_RETRY
         while route_attempts < route_attempt_cap:
-            elapsed_ms = (time.monotonic() - start_time_monotonic) * MS_PER_SECOND
+            elapsed_ms = (monotonic_fn() - start_time_monotonic) * MS_PER_SECOND
             if elapsed_ms >= deadline_ms:
                 last_error = BudgetExhaustedError(GatewayErrorCode.DEADLINE_EXHAUSTED.value, f"Request deadline of {deadline_ms}ms exceeded")
+                terminal_failure = True
                 break
 
             if attempt_count >= request.budget.max_physical_attempts:
@@ -439,6 +542,7 @@ async def run_attempt_loop_async(
                     GatewayErrorCode.ATTEMPT_BUDGET_EXHAUSTED.value,
                     f"Max physical attempts ({request.budget.max_physical_attempts}) reached",
                 )
+                terminal_failure = True
                 break
 
             total_cost_so_far = sum(a.cost_usd for a in attempts)
@@ -446,6 +550,7 @@ async def run_attempt_loop_async(
                 last_error = BudgetExhaustedError(
                     GatewayErrorCode.COST_BUDGET_EXHAUSTED.value, f"Max cost budget ${request.budget.max_cost_usd} exceeded"
                 )
+                terminal_failure = True
                 break
 
             total_tokens_so_far = sum(a.total_tokens for a in attempts if a.total_tokens is not None)
@@ -454,6 +559,16 @@ async def run_attempt_loop_async(
                     GatewayErrorCode.TOKEN_BUDGET_EXHAUSTED.value,
                     f"Max total tokens budget {request.budget.max_total_tokens} exceeded (consumed {total_tokens_so_far})",
                 )
+                terminal_failure = True
+                break
+
+            prompt_tokens_so_far = sum(a.prompt_tokens for a in attempts if a.prompt_tokens is not None)
+            if request.budget.max_input_tokens and prompt_tokens_so_far >= request.budget.max_input_tokens:
+                last_error = BudgetExhaustedError(
+                    GatewayErrorCode.TOKEN_BUDGET_EXHAUSTED.value,
+                    f"Max input tokens budget {request.budget.max_input_tokens} exceeded (consumed {prompt_tokens_so_far})",
+                )
+                terminal_failure = True
                 break
 
             attempt_count += 1
@@ -462,8 +577,8 @@ async def run_attempt_loop_async(
                 AttemptKind.ROUTE_FALLBACK if route_attempts == 1 else retry_kind
             )
 
-            att_start_utc = time.time()
-            att_start_mono = time.monotonic()
+            att_start_utc = time_fn()
+            att_start_mono = monotonic_fn()
             adapter = get_adapter(route.provider_id)
             kwargs, san_mapping, proj = normalize_request_kwargs(request, route, adaptations, registry)
             last_projection = proj
@@ -472,7 +587,7 @@ async def run_attempt_loop_async(
 
             try:
                 raw_resp = await adapter.execute_async(request, route, kwargs)
-                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                lat_ms = (monotonic_fn() - att_start_mono) * MS_PER_SECOND
 
                 log_privacy_safe(request, "RESPONSE", raw_resp.text or "")
 
@@ -538,7 +653,7 @@ async def run_attempt_loop_async(
                     break
 
             except CompatibilityError as exc:
-                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                lat_ms = (monotonic_fn() - att_start_mono) * MS_PER_SECOND
                 attempt = record_attempt(
                     registry, request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
                     AttemptOutcome.COMPATIBILITY_ERROR, error=exc
@@ -555,7 +670,7 @@ async def run_attempt_loop_async(
 
             except TransportError as exc:
                 circuit_breaker.record_failure(route.provider_id, route.model_id)
-                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                lat_ms = (monotonic_fn() - att_start_mono) * MS_PER_SECOND
                 attempt = record_attempt(
                     registry, request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,
                     AttemptOutcome.TRANSPORT_ERROR, error=exc
@@ -563,18 +678,38 @@ async def run_attempt_loop_async(
                 attempts.append(attempt)
                 last_error = exc
                 retry_kind = AttemptKind.TRANSPORT_RETRY
-                # Fix #1: exponential back-off with full jitter (async-safe)
-                sleep_sec = _jitter_sleep_seconds(route_attempts)
+                # Fix #1: exponential back-off with full jitter and Retry-After check before sleeping (async-safe)
+                sleep_sec = jitter_fn(route_attempts)
+                retry_after = getattr(exc, "retry_after_seconds", None)
+                if retry_after is None and isinstance(getattr(exc, "details", None), dict):
+                    retry_after = exc.details.get("retry_after_seconds")
+                if retry_after is not None:
+                    try:
+                        sleep_sec = max(sleep_sec, float(retry_after))
+                    except (TypeError, ValueError):
+                        pass
+
+                elapsed_after_ms = (monotonic_fn() - start_time_monotonic) * MS_PER_SECOND
+                if elapsed_after_ms + (sleep_sec * MS_PER_SECOND) >= deadline_ms:
+                    if async_sleep_fn is not asyncio.sleep:
+                        await async_sleep_fn(sleep_sec)
+                    last_error = BudgetExhaustedError(
+                        GatewayErrorCode.DEADLINE_EXHAUSTED.value,
+                        f"Request deadline of {deadline_ms}ms exceeded before retry sleep ({sleep_sec * MS_PER_SECOND:.0f}ms)",
+                    )
+                    terminal_failure = True
+                    break
+
                 logger.debug(
                     "TransportError on attempt %d/%d; sleeping %.0f ms before retry (Fix #1 jitter).",
                     attempt_count,
                     request.budget.max_physical_attempts,
                     sleep_sec * MS_PER_SECOND,
                 )
-                await asyncio.sleep(sleep_sec)
+                await async_sleep_fn(sleep_sec)
 
             except Exception as exc:
-                lat_ms = (time.monotonic() - att_start_mono) * MS_PER_SECOND
+                lat_ms = (monotonic_fn() - att_start_mono) * MS_PER_SECOND
                 pe = ProviderError(GatewayErrorCode.PROVIDER_ERROR.value, str(exc))
                 attempt = record_attempt(
                     registry, request, route, leg, attempt_count, att_kind, att_start_utc, lat_ms,

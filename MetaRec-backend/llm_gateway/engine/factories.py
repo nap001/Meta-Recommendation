@@ -13,17 +13,47 @@ from llm_gateway.engine.core import GatewayEngine
 def create_engine(
     registry: Optional[ProviderRegistry] = None,
     validator_hook: Optional[Callable[..., Any]] = None,
+    clock: Optional[Any] = None,
+    monotonic_fn: Optional[Callable[[], float]] = None,
+    time_fn: Optional[Callable[[], float]] = None,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+    async_sleep_fn: Optional[Callable[[float], Any]] = None,
+    jitter_fn: Optional[Callable[[int], float]] = None,
 ) -> GatewayEngine:
     """Create a fresh, isolated GatewayEngine instance."""
-    return GatewayEngine(registry=registry, validator_hook=validator_hook)
+    return GatewayEngine(
+        registry=registry,
+        validator_hook=validator_hook,
+        clock=clock,
+        monotonic_fn=monotonic_fn,
+        time_fn=time_fn,
+        sleep_fn=sleep_fn,
+        async_sleep_fn=async_sleep_fn,
+        jitter_fn=jitter_fn,
+    )
 
 
 def create_engine_for_registry(
     registry: ProviderRegistry,
     validator_hook: Optional[Callable[..., Any]] = None,
+    clock: Optional[Any] = None,
+    monotonic_fn: Optional[Callable[[], float]] = None,
+    time_fn: Optional[Callable[[], float]] = None,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+    async_sleep_fn: Optional[Callable[[float], Any]] = None,
+    jitter_fn: Optional[Callable[[int], float]] = None,
 ) -> GatewayEngine:
     """Convenience alias for ``create_engine(registry=registry)``."""
-    return GatewayEngine(registry=registry, validator_hook=validator_hook)
+    return GatewayEngine(
+        registry=registry,
+        validator_hook=validator_hook,
+        clock=clock,
+        monotonic_fn=monotonic_fn,
+        time_fn=time_fn,
+        sleep_fn=sleep_fn,
+        async_sleep_fn=async_sleep_fn,
+        jitter_fn=jitter_fn,
+    )
 
 
 # Global engine singleton

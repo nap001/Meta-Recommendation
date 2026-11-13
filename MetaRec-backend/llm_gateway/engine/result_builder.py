@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from llm_gateway.constants import (
     DegradationReason,
@@ -38,9 +38,11 @@ def build_result(
     start_time_utc: float,
     start_time_monotonic: float,
     deadline_ms: int,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    time_fn: Callable[[], float] = time.time,
 ) -> LLMResultV1:
     """Assemble LLMResultV1 from attempt data (shared by sync and async paths)."""
-    total_lat_ms = (time.monotonic() - start_time_monotonic) * MS_PER_SECOND
+    total_lat_ms = (monotonic_fn() - start_time_monotonic) * MS_PER_SECOND
     tot_prompt = sum(a.prompt_tokens for a in attempts if a.prompt_tokens is not None)
     tot_comp = sum(a.completion_tokens for a in attempts if a.completion_tokens is not None)
     tot_tokens = sum(a.total_tokens for a in attempts if a.total_tokens is not None)
@@ -56,7 +58,7 @@ def build_result(
     )
     timing = TimingSummaryV1(
         started_at_utc=start_time_utc,
-        completed_at_utc=time.time(),
+        completed_at_utc=time_fn(),
         total_latency_ms=round(total_lat_ms, 2),
         deadline_ms=deadline_ms,
     )
@@ -79,7 +81,9 @@ def build_result(
             errors=[],
         )
         attempt_count = len(attempts)
-        if attempt_count >= request.budget.max_physical_attempts:
+        if isinstance(last_error, BudgetExhaustedError):
+            pass
+        elif attempt_count >= request.budget.max_physical_attempts:
             last_error = BudgetExhaustedError(
                 GatewayErrorCode.ATTEMPT_BUDGET_EXHAUSTED.value,
                 f"Max physical attempts ({request.budget.max_physical_attempts}) reached",
