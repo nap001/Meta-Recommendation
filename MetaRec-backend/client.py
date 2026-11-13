@@ -9,7 +9,7 @@ dotenv_path = find_dotenv()
 load_dotenv(dotenv_path)
 
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://agenthiack.openai.azure.com/")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "https://api.groq.com/openai/v1"
 

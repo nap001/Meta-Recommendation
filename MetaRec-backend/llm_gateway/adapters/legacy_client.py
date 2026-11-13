@@ -190,6 +190,8 @@ class LegacyClientAdapter(BaseLLMAdapter):
         return parse_legacy_response(response, route.model_id)
 
     def execute(self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]) -> RawAdapterResponse:
+        if "model" in self.wire_request and route.model_id:
+            self.wire_request["model"] = route.model_id
         try:
             response = self.client.chat.completions.create(**self.wire_request)
         except Exception as exc:
@@ -202,6 +204,8 @@ class LegacyClientAdapter(BaseLLMAdapter):
     async def execute_async(
         self, request: LLMRequestV1, route: RouteV1, normalized_kwargs: Dict[str, Any]
     ) -> RawAdapterResponse:
+        if "model" in self.wire_request and route.model_id:
+            self.wire_request["model"] = route.model_id
         try:
             response = await self.client.chat.completions.create(**self.wire_request)
         except Exception as exc:

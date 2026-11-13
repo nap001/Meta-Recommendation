@@ -49,6 +49,7 @@ from llm_gateway.contracts import (
     MessageV1,
     OutputPayloadV1,
     PolicyContextV1,
+    PolicyLeg,
     RequestMode,
     RequestRole,
     ResponseContractV1,
@@ -61,6 +62,13 @@ from llm_gateway.contracts import (
     ValidationSummaryV1,
 )
 from llm_gateway.engine import GatewayEngine, create_engine
+from llm_gateway.safety_context import (
+    CONFIRMATION_CONTEXT_PRODUCER_ID,
+    SUMMARY_SAFETY_PRODUCER_ID,
+    build_confirmation_safety_context,
+    build_summary_safety_context,
+    infer_caller_policy_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -192,13 +200,78 @@ def _generation_from_wire(wire: Dict[str, Any]) -> GenerationConfigV1:
     return GenerationConfigV1(temperature=temperature, max_output_tokens=max_output, seed=seed, stop=stop_list)
 
 
-def build_legacy_request(wire: Dict[str, Any]) -> LLMRequestV1:
+# MetaRec-only policy fields stripped from the wire request before calling the provider SDK
+METAREC_POLICY_FIELDS = frozenset({
+    "policy_tag",
+    "policy_context",
+    "response_contract",
+    "routing_policy",
+    "budget",
+    "trace_context",
+    "privacy",
+})
+
+
+def strip_metarec_policy_fields(wire: Dict[str, Any]) -> Dict[str, Any]:
+    """Pop MetaRec-only policy fields from ``wire`` in-place and return them."""
+    extracted: Dict[str, Any] = {}
+    for key in METAREC_POLICY_FIELDS:
+        if key in wire:
+            extracted[key] = wire.pop(key)
+    return extracted
+
+
+def _coerce_policy_context(raw_ctx: Any) -> PolicyContextV1:
+    if isinstance(raw_ctx, PolicyContextV1):
+        return raw_ctx
+    if isinstance(raw_ctx, dict):
+        try:
+            return PolicyContextV1(**raw_ctx)
+        except Exception as exc:
+            logger.debug("Invalid policy_context dict supplied to shim, failing closed: %s", exc)
+    return PolicyContextV1(
+        contains_itinerary_state=True,
+        request_mode=RequestMode.MULTI_DOMAIN,
+        producer_id=LEGACY_PRODUCER_ID,
+    )
+
+
+def _coerce_response_contract(raw_contract: Any) -> ResponseContractV1:
+    if isinstance(raw_contract, ResponseContractV1):
+        return raw_contract
+    if isinstance(raw_contract, dict):
+        try:
+            return ResponseContractV1(**raw_contract)
+        except Exception as exc:
+            logger.debug("Invalid response_contract dict supplied to shim: %s", exc)
+    return ResponseContractV1(
+        kind=ResponseKind.TEXT,
+        schema_id=LEGACY_SCHEMA_ID,
+        semantic_validator_id=SemanticValidatorId.NONE.value,
+        allow_empty=True,  # tool-call-only responses carry no text
+    )
+
+
+def build_legacy_request(
+    wire: Dict[str, Any],
+    meta_fields: Optional[Dict[str, Any]] = None,
+) -> LLMRequestV1:
     """Describe a legacy wire request as a logical ``LLMRequestV1``.
 
-    The policy context is deliberately conservative (itinerary state assumed,
-    non-single-domain mode) so an unenrolled call can never become
-    cheap-route eligible; routing is ``baseline`` on the caller's own model.
+    The policy context defaults to conservative values (itinerary state assumed,
+    non-single-domain mode) when not supplied by an enrolled call site, so an
+    unenrolled call can never become cheap-route eligible.
     """
+    meta = dict(meta_fields or {})
+    for key in METAREC_POLICY_FIELDS:
+        if key in wire and key not in meta:
+            meta[key] = wire.get(key)
+
+    if "policy_tag" not in meta or "policy_context" not in meta:
+        inferred = infer_caller_policy_metadata()
+        for k, v in inferred.items():
+            meta.setdefault(k, v)
+
     model = str(wire.get("model") or "unknown-model")
     try:
         messages = [_to_message(m) for m in (wire.get("messages") or [])]
@@ -207,32 +280,55 @@ def build_legacy_request(wire: Dict[str, Any]) -> LLMRequestV1:
         logger.debug("Legacy shim could not describe request faithfully: %s", exc)
         messages, generation = [], GenerationConfigV1()
 
+    policy_tag = str(meta.get("policy_tag") or LEGACY_POLICY_TAG)
+    policy_context = _coerce_policy_context(meta.get("policy_context"))
+    response_contract = _coerce_response_contract(meta.get("response_contract"))
+
+    raw_routing = meta.get("routing_policy")
+    if isinstance(raw_routing, RoutingPolicyV1):
+        routing_policy = raw_routing
+    elif isinstance(raw_routing, dict):
+        try:
+            routing_policy = RoutingPolicyV1(**raw_routing)
+        except Exception:
+            routing_policy = RoutingPolicyV1(
+                mode=RoutingMode.BASELINE,
+                baseline_route=RouteV1(provider_id=LEGACY_PROVIDER_ID, model_id=model),
+                allowed_provider_ids=[LEGACY_PROVIDER_ID],
+            )
+    else:
+        cheap_model = os.getenv("LLM_CHEAP_MODEL")
+        if cheap_model and policy_tag in {"conversation.summary", "confirmation.payload"}:
+            routing_policy = RoutingPolicyV1(
+                mode=RoutingMode.CHEAP_FIRST,
+                baseline_route=RouteV1(provider_id=LEGACY_PROVIDER_ID, model_id=model),
+                cheap_route=RouteV1(
+                    provider_id=LEGACY_PROVIDER_ID,
+                    model_id=cheap_model,
+                    policy_leg=PolicyLeg.CHEAP,
+                ),
+                allowed_provider_ids=[LEGACY_PROVIDER_ID],
+            )
+        else:
+            routing_policy = RoutingPolicyV1(
+                mode=RoutingMode.BASELINE,
+                baseline_route=RouteV1(provider_id=LEGACY_PROVIDER_ID, model_id=model),
+                allowed_provider_ids=[LEGACY_PROVIDER_ID],
+            )
+
     return LLMRequestV1(
         request_id=f"legacy-{uuid.uuid4().hex}",
-        policy_tag=LEGACY_POLICY_TAG,
+        policy_tag=policy_tag,
         messages=messages,
         generation=generation,
-        response_contract=ResponseContractV1(
-            kind=ResponseKind.TEXT,
-            schema_id=LEGACY_SCHEMA_ID,
-            semantic_validator_id=SemanticValidatorId.NONE.value,
-            allow_empty=True,  # tool-call-only responses carry no text
-        ),
-        routing_policy=RoutingPolicyV1(
-            mode=RoutingMode.BASELINE,
-            baseline_route=RouteV1(provider_id=LEGACY_PROVIDER_ID, model_id=model),
-            allowed_provider_ids=[LEGACY_PROVIDER_ID],
-        ),
+        response_contract=response_contract,
+        routing_policy=routing_policy,
         budget=BudgetConfigV1(
             deadline_ms=_env_int("LLM_GATEWAY_LEGACY_DEADLINE_MS", _DEFAULT_DEADLINE_MS, min_value=1),
             max_physical_attempts=_max_physical_attempts(),
             max_cost_usd=_env_float("LLM_GATEWAY_LEGACY_MAX_COST_USD", _DEFAULT_MAX_COST_USD, min_value=0.000001),
         ),
-        policy_context=PolicyContextV1(
-            contains_itinerary_state=True,
-            request_mode=RequestMode.MULTI_DOMAIN,
-            producer_id=LEGACY_PRODUCER_ID,
-        ),
+        policy_context=policy_context,
     )
 
 
@@ -272,7 +368,8 @@ def invoke_legacy_chat_completion(
 ) -> Any:
     """Execute a prepared legacy wire request through ``GatewayEngine.invoke_llm``."""
     engine = get_legacy_shim_engine()
-    request = build_legacy_request(wire_request)
+    meta_fields = strip_metarec_policy_fields(wire_request)
+    request = build_legacy_request(wire_request, meta_fields=meta_fields)
     adapter = LegacyClientAdapter(client, wire_request, adapt_fn)
     with bind_legacy_adapter(adapter):
         result = engine.invoke_llm(request, validator_hook=_passthrough_validator)
@@ -284,7 +381,8 @@ async def invoke_legacy_chat_completion_async(
 ) -> Any:
     """Execute a prepared legacy wire request through ``GatewayEngine.invoke_llm_async``."""
     engine = get_legacy_shim_engine()
-    request = build_legacy_request(wire_request)
+    meta_fields = strip_metarec_policy_fields(wire_request)
+    request = build_legacy_request(wire_request, meta_fields=meta_fields)
     adapter = LegacyClientAdapter(client, wire_request, adapt_fn)
     with bind_legacy_adapter(adapter):
         result = await engine.invoke_llm_async(request, validator_hook=_passthrough_validator)

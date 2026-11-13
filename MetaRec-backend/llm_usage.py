@@ -101,6 +101,41 @@ class UsageLedger:
             "cost_usd": round(sum(e.cost_usd for e in self.events), 8),
         }
 
+    def _group_totals(self, key_fn) -> dict[str, dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for event in self.events:
+            bucket_key = str(key_fn(event))
+            bucket = grouped.setdefault(
+                bucket_key,
+                {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                    "attempts": 0,
+                    "attempt_count": 0,
+                },
+            )
+            bucket["prompt_tokens"] += event.prompt_tokens
+            bucket["completion_tokens"] += event.completion_tokens
+            bucket["total_tokens"] += event.total_tokens
+            bucket["cost_usd"] = round(bucket["cost_usd"] + event.cost_usd, 8)
+            bucket["attempts"] += 1
+            bucket["attempt_count"] += 1
+        return grouped
+
+    def totals_by_tag(self) -> dict[str, dict[str, Any]]:
+        """Aggregate token usage, USD cost, and attempt count keyed by ``policy_tag``."""
+        return self._group_totals(lambda e: e.policy_tag or "legacy.unenrolled")
+
+    def totals_by_provider(self) -> dict[str, dict[str, Any]]:
+        """Aggregate token usage, USD cost, and attempt count keyed by ``provider_id``."""
+        return self._group_totals(lambda e: e.provider_id or "unmanaged")
+
+    def totals_by_leg(self) -> dict[str, dict[str, Any]]:
+        """Aggregate token usage, USD cost, and attempt count keyed by ``policy_leg``."""
+        return self._group_totals(lambda e: e.policy_leg or "baseline")
+
 
 # The active ledger for the current async context (request or background task).
 _current_ledger: contextvars.ContextVar[Optional[UsageLedger]] = contextvars.ContextVar(

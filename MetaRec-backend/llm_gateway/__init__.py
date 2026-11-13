@@ -50,6 +50,7 @@ from llm_gateway.constants import (
     SemanticValidatorId,
 )
 from llm_gateway.engine import (
+    FakeClock,
     GatewayEngine,
     create_engine,
     create_engine_for_registry,
@@ -75,8 +76,14 @@ from llm_gateway.errors import (
 )
 
 from llm_gateway.kill_switch import (
+    disable_tag_enrollment,
+    enable_tag_enrollment,
+    get_enrolled_tags,
     get_kill_switch_reason,
     is_kill_switch_active,
+    is_tag_enrolled,
+    reset_enrolled_tags,
+    set_enrolled_tags,
     set_kill_switch,
 )
 from llm_gateway.registry import (
@@ -94,6 +101,13 @@ from llm_gateway.validators import (
     get_validator_registry,
     validate_json_schema,
     validate_json_syntax,
+)
+from llm_gateway.safety_context import (
+    CONFIRMATION_CONTEXT_PRODUCER_ID,
+    SUMMARY_SAFETY_PRODUCER_ID,
+    build_confirmation_safety_context,
+    build_summary_safety_context,
+    infer_caller_policy_metadata,
 )
 
 __all__ = [
@@ -136,6 +150,7 @@ __all__ = [
     "invoke_llm_stream",
     "invoke_llm_stream_async",
     "GatewayEngine",
+    "FakeClock",
     "get_gateway_engine",
     "create_engine",
     "create_engine_for_registry",
@@ -150,6 +165,12 @@ __all__ = [
     "set_kill_switch",
     "is_kill_switch_active",
     "get_kill_switch_reason",
+    "is_tag_enrolled",
+    "get_enrolled_tags",
+    "set_enrolled_tags",
+    "enable_tag_enrollment",
+    "disable_tag_enrollment",
+    "reset_enrolled_tags",
     "LLMErrorV1",
     "ErrorClass",
     "RequestValidationError",
@@ -177,5 +198,10 @@ __all__ = [
     "OpenAICompatibleAdapter",
     "OpenAIBaseAdapter",
     "OpenAIAdapter",
+    "SUMMARY_SAFETY_PRODUCER_ID",
+    "CONFIRMATION_CONTEXT_PRODUCER_ID",
+    "build_summary_safety_context",
+    "build_confirmation_safety_context",
+    "infer_caller_policy_metadata",
 ]
 
