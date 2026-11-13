@@ -247,3 +247,79 @@ def test_attempt_outcome_contract_and_detailed_mapping():
     assert att_transport_err.contract_outcome == AttemptOutcome.NO_RESPONSE_RETURNED
     assert att_transport_err.provider_response_received is False
 
+
+def test_patched_error_taxonomy_and_policy_budgets():
+    """Verify full error taxonomy codes, streaming capability flags, price_table_version, and policy filters."""
+    from llm_gateway.constants import DEFAULT_PRICE_TABLE_VERSION
+    from llm_gateway.contracts import PrivacyConfigV1
+    from llm_gateway.engine import create_engine
+    from llm_gateway.registry import ProviderRegistry
+
+    assert GatewayErrorCode.TOKEN_BUDGET_EXHAUSTED == "token_budget_exhausted"
+    assert GatewayErrorCode.PROVIDER_NOT_ALLOWED == "provider_not_allowed"
+    assert GatewayErrorCode.CAPABILITY_MISMATCH == "capability_mismatch"
+    assert GatewayErrorCode.PRIVACY_POLICY_MISMATCH == "privacy_policy_mismatch"
+
+    reg = ProviderRegistry()
+    for prov in reg.list_providers():
+        assert prov.features.supports_streaming is True
+
+    engine = create_engine(registry=reg)
+    req_ok = LLMRequestV1(
+        request_id="req-ptv-1",
+        policy_tag="intent.analyze_message",
+        messages=[MessageV1(role=RequestRole.USER, content="hi")],
+        routing_policy=RoutingPolicyV1(
+            mode=RoutingMode.BASELINE,
+            baseline_route=RouteV1(provider_id="fake_provider", model_id="fake-fast"),
+        ),
+        policy_context=PolicyContextV1(
+            contains_itinerary_state=False,
+            request_mode=RequestMode.SINGLE_DOMAIN,
+        ),
+    )
+    res_ok = engine.invoke_llm(req_ok)
+    assert res_ok.status == ResultStatus.SUCCEEDED
+    assert res_ok.attempts[0].price_table_version == DEFAULT_PRICE_TABLE_VERSION
+
+    # Disallowed provider check
+    req_disallowed = LLMRequestV1(
+        request_id="req-disallow-1",
+        policy_tag="intent.analyze_message",
+        messages=[MessageV1(role=RequestRole.USER, content="hi")],
+        routing_policy=RoutingPolicyV1(
+            mode=RoutingMode.BASELINE,
+            baseline_route=RouteV1(provider_id="fake_provider", model_id="fake-fast"),
+            allowed_provider_ids=["openai"],
+        ),
+        policy_context=PolicyContextV1(
+            contains_itinerary_state=False,
+            request_mode=RequestMode.SINGLE_DOMAIN,
+        ),
+    )
+    res_disallowed = engine.invoke_llm(req_disallowed)
+    assert res_disallowed.status == ResultStatus.FAILED
+    assert res_disallowed.error.code == GatewayErrorCode.PROVIDER_NOT_ALLOWED.value
+    assert res_disallowed.error.error_class == "policy"
+
+    # Privacy policy mismatch check
+    req_restricted = LLMRequestV1(
+        request_id="req-restricted-1",
+        policy_tag="intent.analyze_message",
+        messages=[MessageV1(role=RequestRole.USER, content="hi")],
+        routing_policy=RoutingPolicyV1(
+            mode=RoutingMode.BASELINE,
+            baseline_route=RouteV1(provider_id="fake_provider", model_id="fake-fast"),
+        ),
+        privacy=PrivacyConfigV1(data_class="restricted"),
+        policy_context=PolicyContextV1(
+            contains_itinerary_state=False,
+            request_mode=RequestMode.SINGLE_DOMAIN,
+        ),
+    )
+    res_restricted = engine.invoke_llm(req_restricted)
+    assert res_restricted.status == ResultStatus.FAILED
+    assert res_restricted.error.code == GatewayErrorCode.PRIVACY_POLICY_MISMATCH.value
+    assert res_restricted.error.error_class == "policy"
+
+
