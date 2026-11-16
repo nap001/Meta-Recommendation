@@ -279,11 +279,11 @@ def test_openai_base_gateway_fallback_ladder():
             mode=RoutingMode.BASELINE,
             baseline_route=RouteV1(
                 provider_id="openai_base",
-                model_id="gpt-4o-mini",
+                model_id="gpt-6-mini",
                 policy_leg=PolicyLeg.BASELINE,
             ),
             fallback_routes=[
-                RouteV1(provider_id="azure_openai", model_id="gpt-4o-mini", policy_leg=PolicyLeg.FALLBACK)
+                RouteV1(provider_id="azure_openai", model_id="gpt-6-mini", policy_leg=PolicyLeg.FALLBACK)
             ],
         ),
         budget=BudgetConfigV1(deadline_ms=5000, max_physical_attempts=3, max_cost_usd=0.50),

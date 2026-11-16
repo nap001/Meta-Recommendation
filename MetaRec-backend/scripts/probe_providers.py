@@ -66,10 +66,10 @@ SUPPORTED_PROVIDERS: List[str] = [
 ]
 
 DEFAULT_PROBE_MODELS: Dict[str, str] = {
-    ProviderId.OPENAI.value: "gpt-4o-mini",
-    ProviderId.AZURE_OPENAI.value: "gpt-4o-mini",
-    ProviderId.GROQ.value: "llama-3.3-70b-versatile",
-    ProviderId.ANTHROPIC.value: "claude-3-5-haiku-latest",
+    ProviderId.OPENAI.value: "gpt-6-mini",
+    ProviderId.AZURE_OPENAI.value: "gpt-6-mini",
+    ProviderId.GROQ.value: "openai/gpt-oss-120b",
+    ProviderId.ANTHROPIC.value: "claude-3-5-haiku-20241022",
 }
 
 

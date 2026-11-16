@@ -86,10 +86,10 @@ class ProviderRegistry:
             enabled=True,
             credential_status=CredentialStatus.READY.value if os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY") else CredentialStatus.MISSING.value,
             models=[
-                ModelLimitV1(model_id="qwen/qwen3.8-27b", context_window=32768, max_output_tokens=8192),
-                ModelLimitV1(model_id="allam-2-7b", context_window=8192, max_output_tokens=4096),
-                ModelLimitV1(model_id="llama-3.3-70b-versatile", context_window=DEFAULT_MODEL_CONTEXT_WINDOW, max_output_tokens=8192),
-                ModelLimitV1(model_id="llama-3.1-8b-instant", context_window=DEFAULT_MODEL_CONTEXT_WINDOW, max_output_tokens=DEFAULT_MODEL_MAX_OUTPUT_TOKENS),
+                ModelLimitV1(model_id="openai/gpt-oss-120b", context_window=131072, max_output_tokens=65536),
+                ModelLimitV1(model_id="openai/gpt-oss-20b", context_window=131072, max_output_tokens=65536),
+                ModelLimitV1(model_id="qwen/qwen3.8-27b", context_window=131072, max_output_tokens=16384),
+                ModelLimitV1(model_id="allam-2-7b", context_window=4096, max_output_tokens=4096),
             ],
             features=ProviderFeaturesV1(
                 supports_sync=True,
@@ -185,8 +185,6 @@ class ProviderRegistry:
             models=[
                 ModelLimitV1(model_id="claude-3-5-sonnet-20241022", context_window=200000, max_output_tokens=8192),
                 ModelLimitV1(model_id="claude-3-5-haiku-20241022", context_window=200000, max_output_tokens=8192),
-                ModelLimitV1(model_id="claude-3-opus-20240229", context_window=200000, max_output_tokens=DEFAULT_MODEL_MAX_OUTPUT_TOKENS),
-                ModelLimitV1(model_id="claude-3-haiku-20240307", context_window=200000, max_output_tokens=DEFAULT_MODEL_MAX_OUTPUT_TOKENS),
             ],
             features=ProviderFeaturesV1(
                 supports_sync=True,
@@ -216,10 +214,10 @@ class ProviderRegistry:
                 "fake_provider:fake-fast": ModelPriceV1(input_price_per_1m=0.10, output_price_per_1m=0.20),
                 "fake_provider:fake-strong": ModelPriceV1(input_price_per_1m=2.50, output_price_per_1m=10.00),
                 "fake_provider:fake-reasoning": ModelPriceV1(input_price_per_1m=3.00, output_price_per_1m=12.00),
-                "groq:qwen/qwen3.8-27b": ModelPriceV1(input_price_per_1m=0.20, output_price_per_1m=0.20),
+                "groq:openai/gpt-oss-120b": ModelPriceV1(input_price_per_1m=0.15, output_price_per_1m=0.60),
+                "groq:openai/gpt-oss-20b": ModelPriceV1(input_price_per_1m=0.075, output_price_per_1m=0.30),
+                "groq:qwen/qwen3.8-27b": ModelPriceV1(input_price_per_1m=0.80, output_price_per_1m=4.00),
                 "groq:allam-2-7b": ModelPriceV1(input_price_per_1m=0.10, output_price_per_1m=0.10),
-                "groq:llama-3.3-70b-versatile": ModelPriceV1(input_price_per_1m=0.59, output_price_per_1m=0.79),
-                "groq:llama-3.1-8b-instant": ModelPriceV1(input_price_per_1m=0.05, output_price_per_1m=0.08),
                 "azure_openai:gpt-6": ModelPriceV1(input_price_per_1m=2.50, output_price_per_1m=10.00),
                 "azure_openai:gpt-6-mini": ModelPriceV1(input_price_per_1m=0.15, output_price_per_1m=0.60),
                 "azure_openai:o3": ModelPriceV1(input_price_per_1m=3.00, output_price_per_1m=12.00),
@@ -231,20 +229,8 @@ class ProviderRegistry:
                 "openai_base:gpt-6-mini": ModelPriceV1(input_price_per_1m=0.15, output_price_per_1m=0.60),
                 "openai_base:o3": ModelPriceV1(input_price_per_1m=3.00, output_price_per_1m=12.00),
                 "openai_base:o3-mini": ModelPriceV1(input_price_per_1m=1.10, output_price_per_1m=4.40),
-                # Legacy rates retained for audit log replay & backwards compatibility
-                "azure_openai:gpt-4o": ModelPriceV1(input_price_per_1m=2.50, output_price_per_1m=10.00),
-                "azure_openai:gpt-4o-mini": ModelPriceV1(input_price_per_1m=0.15, output_price_per_1m=0.60),
-                "azure_openai:o4-mini": ModelPriceV1(input_price_per_1m=3.00, output_price_per_1m=12.00),
-                "openai:gpt-4o": ModelPriceV1(input_price_per_1m=2.50, output_price_per_1m=10.00),
-                "openai:gpt-4o-mini": ModelPriceV1(input_price_per_1m=0.15, output_price_per_1m=0.60),
-                "openai:o1-mini": ModelPriceV1(input_price_per_1m=3.00, output_price_per_1m=12.00),
-                "openai_base:gpt-4o": ModelPriceV1(input_price_per_1m=2.50, output_price_per_1m=10.00),
-                "openai_base:gpt-4o-mini": ModelPriceV1(input_price_per_1m=0.15, output_price_per_1m=0.60),
-                "openai_base:o1-mini": ModelPriceV1(input_price_per_1m=3.00, output_price_per_1m=12.00),
                 "anthropic:claude-3-5-sonnet-20241022": ModelPriceV1(input_price_per_1m=3.00, output_price_per_1m=15.00),
                 "anthropic:claude-3-5-haiku-20241022": ModelPriceV1(input_price_per_1m=0.80, output_price_per_1m=4.00),
-                "anthropic:claude-3-opus-20240229": ModelPriceV1(input_price_per_1m=15.00, output_price_per_1m=75.00),
-                "anthropic:claude-3-haiku-20240307": ModelPriceV1(input_price_per_1m=0.25, output_price_per_1m=1.25),
             },
         )
         self.register_pricing_snapshot(default_pricing)

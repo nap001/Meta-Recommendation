@@ -46,7 +46,8 @@ def test_anthropic_provider_registration():
     models = {m.model_id for m in anthropic_prov.models}
     assert "claude-3-5-sonnet-20241022" in models
     assert "claude-3-5-haiku-20241022" in models
-    assert "claude-3-opus-20240229" in models
+    assert "claude-3-opus-20240229" not in models
+    assert "claude-3-haiku-20240307" not in models
 
     pricing = registry.get_pricing_snapshot("default-pricing-v1")
     cost_sonnet = pricing.calculate_cost_usd("anthropic", "claude-3-5-sonnet-20241022", 1000, 500)
@@ -295,7 +296,7 @@ def test_anthropic_gateway_fallback_to_openai():
                 policy_leg=PolicyLeg.BASELINE,
             ),
             fallback_routes=[
-                RouteV1(provider_id="openai", model_id="gpt-4o-mini", policy_leg=PolicyLeg.FALLBACK)
+                RouteV1(provider_id="openai", model_id="gpt-6-mini", policy_leg=PolicyLeg.FALLBACK)
             ],
         ),
         budget=BudgetConfigV1(deadline_ms=6000, max_physical_attempts=3, max_cost_usd=0.50),

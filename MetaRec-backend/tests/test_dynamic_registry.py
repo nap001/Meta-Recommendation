@@ -46,8 +46,8 @@ def test_dynamic_registry_inheritance_and_defaults():
 
     snapshot = reg.get_pricing_snapshot("default-pricing-v1")
     assert snapshot is not None
-    assert "openai:gpt-4o" in snapshot.rates
-    assert snapshot.rates["openai:gpt-4o"].input_price_per_1m == 2.50
+    assert "openai:gpt-6" in snapshot.rates
+    assert snapshot.rates["openai:gpt-6"].input_price_per_1m == 2.50
 
 
 @pytest.mark.asyncio
