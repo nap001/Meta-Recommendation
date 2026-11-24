@@ -9,7 +9,12 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from llm_gateway.adapters.base import RawAdapterResponse
-from llm_gateway.constants import SemanticValidatorId
+from llm_gateway.constants import (
+    DEFAULT_TEXT_SCHEMA_ID,
+    GatewayErrorCode,
+    POLICY_TAG_CONFIRMATION_PAYLOAD,
+    SemanticValidatorId,
+)
 from llm_gateway.contracts import (
     LLMRequestV1,
     OutputPayloadV1,
@@ -20,6 +25,7 @@ from llm_gateway.contracts import (
     ValidationGateStatus,
     ValidationSummaryV1,
 )
+from llm_gateway.errors import RequestValidationError
 from llm_gateway.validators import (
     get_validator_registry,
     validate_json_schema,
@@ -192,6 +198,94 @@ def is_registered_contract(request: LLMRequestV1) -> bool:
         )
     except Exception:
         return False
+
+
+def _is_wp5_validation_hook(hook: Optional[Callable[..., Any]]) -> bool:
+    if hook is None:
+        return False
+    mod = getattr(hook, "__module__", "") or ""
+    return mod.startswith("llm_gateway.validation")
+
+
+def should_run_validation_preflight(
+    request: LLMRequestV1,
+    validator_hook: Optional[Callable[..., Any]] = None,
+    engine_validator_hook: Optional[Callable[..., Any]] = None,
+) -> bool:
+    """Return True when the request targets WP5-B registered validation preflight."""
+    hook = validator_hook or engine_validator_hook
+    if _is_wp5_validation_hook(hook):
+        return True
+    if is_registered_contract(request):
+        return True
+
+    contract = request.response_contract
+    try:
+        from llm_gateway.validation.schemas import registered_validator_ids
+
+        registered_validators = set(registered_validator_ids()) - {SemanticValidatorId.NONE.value}
+        if contract.semantic_validator_id in registered_validators:
+            return True
+    except Exception:
+        pass
+
+    # Enrolled confirmation.payload callers specifying a custom/non-passthrough schema_id
+    # must fail preflight cleanly if misconfigured instead of reaching a provider.
+    if (
+        request.policy_tag == POLICY_TAG_CONFIRMATION_PAYLOAD
+        and contract.schema_id not in (DEFAULT_TEXT_SCHEMA_ID, "legacy.passthrough.v1")
+    ):
+        return True
+
+    return False
+
+
+def preflight_request_contract(
+    request: LLMRequestV1,
+    validator_hook: Optional[Callable[..., Any]] = None,
+    engine_validator_hook: Optional[Callable[..., Any]] = None,
+) -> Optional[RequestValidationError]:
+    """Run WP5-B response-contract preflight before provider invocation.
+
+    Returns a terminal ``RequestValidationError`` (ErrorClass.REQUEST, retryable=False)
+    if preflight fails, else ``None``.
+    """
+    if not should_run_validation_preflight(
+        request,
+        validator_hook=validator_hook,
+        engine_validator_hook=engine_validator_hook,
+    ):
+        return None
+
+    from llm_gateway.validation.preflight import (
+        PreflightIssueCode,
+        preflight_response_contract,
+    )
+
+    preflight = preflight_response_contract(request.response_contract)
+    if preflight.passed:
+        return None
+
+    issue = preflight.first_issue
+    issue_code = issue.code.value if issue else "unknown"
+    issue_message = issue.message if issue else "Invalid response contract."
+
+    if issue and issue.code == PreflightIssueCode.UNKNOWN_SCHEMA_ID:
+        gateway_code = GatewayErrorCode.UNKNOWN_SCHEMA.value
+    else:
+        gateway_code = GatewayErrorCode.INVALID_REQUEST.value
+
+    return RequestValidationError(
+        gateway_code,
+        f"Response contract preflight failed ({issue_code}): {issue_message}",
+        details={
+            "preflight_issue_code": issue_code,
+            "preflight_issues": [
+                {"code": item.code.value, "message": item.message}
+                for item in preflight.issues
+            ],
+        },
+    )
 
 
 def execute_registered_validation_hook(

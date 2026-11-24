@@ -32,7 +32,7 @@ from llm_gateway.contracts import (
     ValidationGateResultV1,
     ValidationSummaryV1,
 )
-from llm_gateway.errors import LLMErrorV1
+from llm_gateway.errors import LLMErrorV1, RequestValidationError
 from llm_gateway.registry import ProviderRegistry, get_provider_registry
 from llm_gateway.engine.attempt import (
     log_privacy_safe,
@@ -62,6 +62,7 @@ from llm_gateway.engine.validation_runner import (
     is_payload_contract_compatible,
     is_registered_contract,
     is_terminal_validation_error,
+    preflight_request_contract,
     validate_output_gate,
 )
 
@@ -322,6 +323,17 @@ class GatewayEngine:
             self.last_tool_projection = last_proj
         return attempts, released_output, selected_route, final_val_summary, degradation, last_error
 
+    def _preflight_request(
+        self,
+        request: LLMRequestV1,
+        validator_hook: Optional[Callable[..., Any]] = None,
+    ) -> Optional[RequestValidationError]:
+        return preflight_request_contract(
+            request,
+            validator_hook=validator_hook,
+            engine_validator_hook=self.validator_hook,
+        )
+
     def invoke_llm(
         self,
         request: LLMRequestV1,
@@ -331,6 +343,21 @@ class GatewayEngine:
         start_time_monotonic = self._monotonic_fn()
         start_time_utc = self._time_fn()
         deadline_ms = request.budget.deadline_ms
+
+        preflight_err = self._preflight_request(request, validator_hook=validator_hook)
+        if preflight_err is not None:
+            return self._build_result(
+                request,
+                [],
+                None,
+                None,
+                ValidationSummaryV1(validator_id=request.response_contract.semantic_validator_id),
+                None,
+                preflight_err,
+                start_time_utc,
+                start_time_monotonic,
+                deadline_ms,
+            )
 
         initial_route, initial_leg = self._determine_initial_route(request)
         route_ladder = self._build_route_ladder(request, initial_route, initial_leg)
@@ -356,6 +383,21 @@ class GatewayEngine:
         start_time_monotonic = self._monotonic_fn()
         start_time_utc = self._time_fn()
         deadline_ms = request.budget.deadline_ms
+
+        preflight_err = self._preflight_request(request, validator_hook=validator_hook)
+        if preflight_err is not None:
+            return self._build_result(
+                request,
+                [],
+                None,
+                None,
+                ValidationSummaryV1(validator_id=request.response_contract.semantic_validator_id),
+                None,
+                preflight_err,
+                start_time_utc,
+                start_time_monotonic,
+                deadline_ms,
+            )
 
         initial_route, initial_leg = self._determine_initial_route(request)
         route_ladder = self._build_route_ladder(request, initial_route, initial_leg)
@@ -386,12 +428,18 @@ class GatewayEngine:
 
     def invoke_llm_stream(self, request: LLMRequestV1):
         """Synchronously stream delta tokens for an LLMRequestV1 across route ladder."""
+        preflight_err = self._preflight_request(request)
+        if preflight_err is not None:
+            raise preflight_err
         initial_route, initial_leg = self._determine_initial_route(request)
         route_ladder = self._build_route_ladder(request, initial_route, initial_leg)
         return run_stream_sync(request, route_ladder, self.get_adapter, self.circuit_breaker, self.registry)
 
     async def invoke_llm_stream_async(self, request: LLMRequestV1):
         """Asynchronously stream delta tokens for an LLMRequestV1 across route ladder."""
+        preflight_err = self._preflight_request(request)
+        if preflight_err is not None:
+            raise preflight_err
         initial_route, initial_leg = self._determine_initial_route(request)
         route_ladder = self._build_route_ladder(request, initial_route, initial_leg)
         async for chunk in run_stream_async(request, route_ladder, self.get_adapter, self.circuit_breaker, self.registry):

@@ -24,7 +24,13 @@ from llm_gateway.contracts import (
     ValidationGateStatus,
     ValidationSummaryV1,
 )
-from llm_gateway.errors import BudgetExhaustedError, ErrorClass, LLMErrorV1
+from llm_gateway.errors import (
+    BudgetExhaustedError,
+    ErrorClass,
+    LLMErrorV1,
+    PolicyViolationError,
+    RequestValidationError,
+)
 
 
 def build_result(
@@ -81,7 +87,7 @@ def build_result(
             errors=[],
         )
         attempt_count = len(attempts)
-        if isinstance(last_error, BudgetExhaustedError):
+        if isinstance(last_error, (BudgetExhaustedError, RequestValidationError, PolicyViolationError)):
             pass
         elif attempt_count >= request.budget.max_physical_attempts:
             last_error = BudgetExhaustedError(

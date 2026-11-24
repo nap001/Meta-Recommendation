@@ -254,3 +254,137 @@ def test_budget_exhaustion_bounds_repair_attempts():
     assert result.output is None
     assert len(result.attempts) == 1
     assert result.attempts[0].outcome == AttemptOutcome.VALIDATION_ERROR
+
+
+def test_preflight_blocks_invalid_registered_contract_before_provider_sync_and_async():
+    """Preflight must reject invalid registered contracts at 0 attempts, $0 cost, ErrorClass.REQUEST."""
+    from llm_usage import UsageLedger, push_ledger, reset_ledger
+
+    engine = create_engine()
+    adapter = FakeLLMAdapter()
+    engine.register_adapter("fake_provider", adapter)
+
+    bad_contract = _confirmation_contract().model_copy(
+        update={
+            "validator_inputs": {
+                "allowed_preference_patch_keys": ["use_case"],
+                "unexpected_key": True,
+            }
+        }
+    )
+    req = _confirmation_request(max_physical_attempts=3).model_copy(
+        update={"response_contract": bad_contract}
+    )
+
+    # Enqueue response so we prove the adapter is never touched
+    adapter.enqueue_response(ScriptedResponse(text=_valid_confirmation_json()))
+    ledger = UsageLedger()
+    token = push_ledger(ledger)
+    try:
+        sync_res = engine.invoke_llm(req)
+        async_res = asyncio.run(engine.invoke_llm_async(req))
+    finally:
+        reset_ledger(token)
+
+    for res in (sync_res, async_res):
+        assert res.status == ResultStatus.FAILED
+        assert res.output is None
+        assert res.selected_route is None
+        assert res.attempts == []
+        assert res.usage.total_tokens == 0
+        assert res.usage.cost_usd == 0.0
+        assert res.error is not None
+        assert res.error.error_class == "request"
+        assert res.error.code == "invalid_request"
+        assert res.error.retryable is False
+        assert res.error.details["preflight_issue_code"] == "invalid_validator_inputs"
+
+    assert adapter.call_history == []
+    assert ledger.events == []
+
+
+def test_preflight_blocks_unknown_schema_id_with_unknown_schema_code_sync_and_async():
+    """Unknown schema on registered validator / WP5-B hook emits terminal RequestValidationError(unknown_schema)."""
+    from llm_gateway.validation import create_wp5_external_validation_hook, register_wp5_semantic_validators
+    from llm_gateway.validators import ValidatorRegistry
+
+    engine = create_engine()
+    adapter = FakeLLMAdapter()
+    engine.register_adapter("fake_provider", adapter)
+    adapter.enqueue_response(ScriptedResponse(text="should never run"))
+
+    # Case 1: Auto-dispatch path with registered validator ID & unknown schema_id
+    bad_conf_contract = _confirmation_contract().model_copy(
+        update={"schema_id": "unknown.confirmation.v99"}
+    )
+    req_conf = _confirmation_request().model_copy(update={"response_contract": bad_conf_contract})
+    res_conf = engine.invoke_llm(req_conf)
+
+    assert res_conf.status == ResultStatus.FAILED
+    assert res_conf.attempts == []
+    assert res_conf.usage.cost_usd == 0.0
+    assert res_conf.error is not None
+    assert res_conf.error.error_class == "request"
+    assert res_conf.error.code == "unknown_schema"
+    assert res_conf.error.retryable is False
+    assert res_conf.error.details["preflight_issue_code"] == "unknown_schema_id"
+
+    # Case 2: Explicit WP5-B hook with semantic_validator_id="none" & unknown schema_id (async)
+    reg = ValidatorRegistry()
+    register_wp5_semantic_validators(reg)
+    hook = create_wp5_external_validation_hook(registry=reg)
+    bad_sum_contract = ResponseContractV1(
+        kind=ResponseKind.TEXT,
+        schema_id="unknown.summary.v99",
+        json_schema=None,
+        semantic_validator_id=SemanticValidatorId.NONE.value,
+        validator_inputs={},
+        allow_empty=False,
+    )
+    req_sum = _confirmation_request().model_copy(
+        update={"policy_tag": "conversation.summary", "response_contract": bad_sum_contract}
+    )
+    res_sum = asyncio.run(engine.invoke_llm_async(req_sum, validator_hook=hook))
+
+    assert res_sum.status == ResultStatus.FAILED
+    assert res_sum.attempts == []
+    assert res_sum.usage.cost_usd == 0.0
+    assert res_sum.error is not None
+    assert res_sum.error.error_class == "request"
+    assert res_sum.error.code == "unknown_schema"
+    assert res_sum.error.retryable is False
+    assert adapter.call_history == []
+
+
+def test_preflight_blocks_streaming_entry_points_before_provider_call():
+    """Streaming entry points fail fast with RequestValidationError before calling adapter."""
+    from llm_gateway.errors import RequestValidationError
+
+    engine = create_engine()
+    adapter = FakeLLMAdapter()
+    engine.register_adapter("fake_provider", adapter)
+
+    bad_contract = ResponseContractV1(
+        kind=ResponseKind.JSON,
+        schema_id=CONVERSATION_SUMMARY_SCHEMA_ID,
+        json_schema={"type": "object"},
+        semantic_validator_id=SemanticValidatorId.NONE.value,
+        allow_empty=False,
+    )
+    req = _confirmation_request().model_copy(
+        update={"policy_tag": "conversation.summary", "response_contract": bad_contract}
+    )
+
+    with pytest.raises(RequestValidationError) as exc_sync:
+        list(engine.invoke_llm_stream(req))
+    assert exc_sync.value.code == "invalid_request"
+    assert exc_sync.value.error_class.value == "request"
+
+    async def _drain():
+        async for _ in engine.invoke_llm_stream_async(req):
+            pass
+
+    with pytest.raises(RequestValidationError) as exc_async:
+        asyncio.run(_drain())
+    assert exc_async.value.code == "invalid_request"
+    assert adapter.call_history == []
